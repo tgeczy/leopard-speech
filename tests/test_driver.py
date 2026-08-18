@@ -526,6 +526,39 @@ def _speakAndWait(driver, seq, timeout=25.0):
     return driver._player.fed - fed0, driver._player.bytes - bytes0
 
 
+class _renderCounter(object):
+    """Count the times the engine was asked to speak.
+
+    How many utterances a sequence became used to be inferred from
+    `player.feed()` calls, one per utterance.  The audio is streamed now, so a
+    single utterance is fed in many chunks and that proxy measures nothing.
+
+    What those tests always meant is how many times the engine was handed
+    text, which is worth counting directly: the property under test is that
+    adjacent fragments become *one* request, and the pause testers reported
+    was one request per fragment.
+    """
+
+    def __init__(self, driver):
+        self.driver = driver
+        self.texts = []
+
+    def __enter__(self):
+        original = self.driver._render
+        self._original = original
+
+        def spy(text, wpm, voice, pitch=0, sink=None):
+            self.texts.append(text)
+            return original(text, wpm, voice, pitch, sink=sink)
+
+        self.driver._render = spy
+        return self
+
+    def __exit__(self, *exc):
+        self.driver._render = self._original
+        return False
+
+
 def test_adjacent_text_is_one_utterance_not_several(driver):
     """A line with a link in it is one sentence, and must sound like one.
 
@@ -536,8 +569,10 @@ def test_adjacent_text_is_one_utterance_not_several(driver):
     the speech pausing before every link.
     """
     _warm(driver)
-    feeds, _b = _speakAndWait(driver, ["Read more about it ", "link", "Home"])
-    assert feeds == 1, "each fragment was still rendered on its own (%d feeds)" % feeds
+    with _renderCounter(driver) as rc:
+        _speakAndWait(driver, ["Read more about it ", "link", "Home"])
+    assert len(rc.texts) == 1, (
+        "each fragment was still rendered on its own: %r" % (rc.texts,))
 
 
 def test_an_index_does_not_split_the_sentence_but_is_still_reported(driver):
@@ -556,10 +591,11 @@ def test_an_index_does_not_split_the_sentence_but_is_still_reported(driver):
     import synthDriverHandler
     _warm(driver)
     before = synthDriverHandler.synthIndexReached.count
-    feeds, _b = _speakAndWait(driver, ["first part ",
-                                       speech.commands.IndexCommand(7),
-                                       "second part"])
-    assert feeds == 1, "the index split the sentence (%d feeds)" % feeds
+    with _renderCounter(driver) as rc:
+        _speakAndWait(driver, ["first part ",
+                               speech.commands.IndexCommand(7),
+                               "second part"])
+    assert len(rc.texts) == 1, "the index split the sentence: %r" % (rc.texts,)
     assert synthDriverHandler.synthIndexReached.count > before, "index lost"
 
 
@@ -650,9 +686,9 @@ def test_capital_pitch_change_reaches_the_engine(driver, monkeypatch):
     seen = []
     original = driver._render
 
-    def spy(text, wpm, voice, pitch=0):
+    def spy(text, wpm, voice, pitch=0, sink=None):
         seen.append(pitch)
-        return original(text, wpm, voice, pitch)
+        return original(text, wpm, voice, pitch, sink=sink)
 
     _warm(driver)
     monkeypatch.setattr(driver, "_render", spy)
@@ -855,3 +891,54 @@ def test_the_default_utterance_carries_no_embedded_commands(driver):
     a = driver._render("hello there", 180, driver._get_voice())
     b = driver._render("hello there", 180, driver._get_voice())
     assert a and a == b
+
+
+def _waitForFeeds(driver, want, timeout=20.0):
+    """Wait until the player has been fed `want` times, -> the count."""
+    end = time.perf_counter() + timeout
+    while time.perf_counter() < end:
+        if driver._player.fed >= want:
+            break
+        time.sleep(0.002)
+    return driver._player.fed
+
+
+def test_a_long_utterance_sounds_before_it_has_finished_rendering(driver):
+    """The whole reason for streaming, and Alex is why it matters most.
+
+    He renders more audio per character than anything else here, so a
+    paragraph of Alex was the longest wait of all -- and none of it was the
+    engine, which runs at about ninety times real time.  The audio now
+    arrives in chunks and each is fed as it comes.
+
+    Waiting for the utterance to *finish* would mean waiting out its
+    playback, so this only waits for the second chunk: one feed could be a
+    whole utterance handed over at once, two cannot.
+    """
+    _warm(driver)
+    driver.speak(["The quick brown fox jumps over the lazy dog. " * 6])
+    fed = _waitForFeeds(driver, 2)
+    driver.cancel()
+    assert fed >= 2, "the utterance arrived in one piece; nothing streamed"
+
+
+def test_cancel_during_a_streamed_utterance_leaves_the_engine_usable(driver):
+    """Streaming put a cancel inside a response for the first time.
+
+    One utterance is now many chunks arriving over the pipe, so `cancel()`
+    can land while the driver is still reading them.  Walking away from the
+    rest would leave those chunks in the pipe and the *next* response would
+    be read starting from them -- and the answer to a desynchronised pipe is
+    killing the engine, which for Alex means reloading a 701 MB sample bank.
+    So the response is read to its end and only the feeding stops.
+    """
+    _warm(driver)
+    driver.speak(["The quick brown fox jumps over the lazy dog. " * 6])
+    _waitForFeeds(driver, 1)
+    driver.cancel()
+    # Let the worker finish reading that response, and let the interrupted
+    # utterance report its "done", so what follows measures the new utterance
+    # rather than the end of the old one.
+    time.sleep(0.5)
+    _feeds, spoken = _speakAndWait(driver, ["still here"])
+    assert spoken > 0, "the driver went silent after cancelling a stream"
