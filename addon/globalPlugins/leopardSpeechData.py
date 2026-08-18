@@ -33,7 +33,19 @@ _ENGINE_DIR = os.path.join(_ADDON, "synthDrivers", "_leopardspeech")
 if _ENGINE_DIR not in sys.path:
     sys.path.insert(0, _ENGINE_DIR)
 
-import tree                                                   # noqa: E402
+# Imported as `leopardtree`, not `tree`, and that is not cosmetic.
+#
+# Every NVDA add-on shares one `sys.modules`. Both this add-on and its Tiger
+# sibling put their private folder on `sys.path` and used to `import tree`, so
+# whichever loaded first won and the second silently got the first one's
+# module. Installed together, leopard-speech read tigerspeech-data, ran
+# tiger_host.exe, and offered Tiger's twenty-three voices under Leopard's name
+# -- working perfectly, and completely wrong. Nothing failed, which is why it
+# took a user noticing the wrong voices to see it.
+#
+# The alias keeps the body of this file reading `tree.` while the module that
+# is actually loaded has a name no one else will claim.
+import leopardtree as tree                                    # noqa: E402
 
 #: Written only when the user explicitly says "stop asking".
 _MARKER = "do-not-ask"

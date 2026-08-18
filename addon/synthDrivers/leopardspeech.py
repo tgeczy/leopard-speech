@@ -99,7 +99,19 @@ if _ENGINE_DIR not in sys.path:
 # Finding the engine lives in `tree`, not here: the global plugin that offers
 # to open the folder needs exactly the same answer, and two copies of a lookup
 # is two chances to disagree about where the engine is.
-import tree                                                   # noqa: E402
+# Imported as `leopardtree`, not `tree`, and that is not cosmetic.
+#
+# Every NVDA add-on shares one `sys.modules`. Both this add-on and its Tiger
+# sibling put their private folder on `sys.path` and used to `import tree`, so
+# whichever loaded first won and the second silently got the first one's
+# module. Installed together, leopard-speech read tigerspeech-data, ran
+# tiger_host.exe, and offered Tiger's twenty-three voices under Leopard's name
+# -- working perfectly, and completely wrong. Nothing failed, which is why it
+# took a user noticing the wrong voices to see it.
+#
+# The alias keeps the body of this file reading `tree.` while the module that
+# is actually loaded has a name no one else will claim.
+import leopardtree as tree                                    # noqa: E402
 
 HOST_EXE = tree.HOST_EXE
 find_tree = tree.find_tree
