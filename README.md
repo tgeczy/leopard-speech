@@ -1,8 +1,9 @@
 # Leopard-speech
 
-**Not working yet.** This is where Mac OS X 10.5 Leopard's speech engine will
-live if it can be made to run — and, with it, **Alex**, which is the voice
-people actually want.
+**It does not speak yet — but the engine loads, opens a speech channel,
+accepts a voice and runs its own worker threads.** This is where Mac OS X 10.5
+Leopard's speech engine will live once it makes a sound, and with it **Alex**,
+which is the voice people actually want.
 
 Its sibling [tiger-speech](https://github.com/tgeczy/tiger-speech) does the
 same job for 10.4 and works: all twenty-three Tiger voices, natively, about
@@ -43,57 +44,88 @@ binaries:
   before the `$`.
 - **`operator new`.** A thunk returns 0, the engine writes through it, and it
   dies in `SEOpenSpeechChannel`. Written out along with `_List_node_base`.
-- **All five initializers run**, and `SEOpenSpeechChannel` is reached.
-- **The dictionary opens**, resolving all seven of its resources — Leopard has
-  seven where Tiger had four, and no `StdDictionary` at all.
+- **All five initializers run.**
+- **`SEOpenSpeechChannel` returns `noErr`.** All four dictionaries the channel
+  manager wants -- `PrefixDictionary`, `CartNames`, `CartLite` and
+  `SymbolDictionary` -- map to their own files. See below for what stood in the
+  way of that for a day.
+- **`SEUseVoice` and `SESpeakBuffer` return `noErr`**, and the engine reads the
+  voice's `VoiceDescription`.
+- **The engine runs.** It builds an `AUGraph`, negotiates a stream format of
+  22050 Hz mono float, starts it, and spins up its own worker threads, which
+  tick through `Parse`, `Audio?`, `Samples` and `Ping`.
 - **AudioConverter**, which is how Alex decodes where Vicki uses the Sound
   Manager. Implemented and flushed for the Windows 7 decoder quirk.
 
+## The bug that looked like Apple's and was ours
+
+Worth writing down, because it wasted a day and every hypothesis it generated
+was wrong in the same way.
+
+`SEOpenSpeechChannel` crashed inside `SLCartDict::SLCartDict`, reading
+15,336,982 bytes past a 1,638,242-byte mapping of `PrefixDictionary`. The
+arithmetic matched the faulting address to the byte, which made the conclusion
+irresistible: the engine had built the wrong class over the wrong file, and the
+question was why Apple's own code would do that.
+
+It doesn't. Disassembling `SpeechChannelManager::ISpeechChannelManager` shows
+six `CFBundleCopyResourceURL` calls, and the two dictionaries it wraps in
+`SLCartDict` are `CartNames` and `CartLite` -- never `PrefixDictionary`. Those
+two are then merged into an `SLSplitCartDict`. The engine was right all along.
+
+The real cause was in `SLMMapCache::Map(const char *)`, which nothing had
+looked at because it appeared to be working. It stats the path and then walks
+its cache list comparing exactly the first eight bytes of the stat buffer --
+`st_dev` and `st_ino` -- and nothing else. The loader's `stat` shim zeroed the
+whole buffer and filled in only `st_size`, so **every file on disk answered to
+the same key**. `PrefixDictionary` mapped correctly; the six after it were
+served its bytes straight from the cache, without ever reaching `open()`.
+
+The clue was there the whole time and read backwards: one `open()` for seven
+resources looks like six lookups failing, when it was six cache hits
+succeeding. Every one of the four hypotheses ruled out below was ruled out
+correctly. The cause was somewhere nobody had thought to suspect, because it
+was the part that was *not* failing.
+
+Two smaller traps came with it:
+
+- **An anonymous local function inherits the previous global symbol's name.**
+  The crash frame read `SpeechChannelManager::UseVoice + 0x6fe`, and `UseVoice`
+  really is the nearest preceding symbol -- but the function at that address
+  starts at `+0x6c8`, after a complete epilogue, and is a static the linker
+  never named. A day of reading the wrong function.
+- **A spilled PIC base looks exactly like a return address**, which is already
+  written down in the loader's notes and caught nobody by surprise this time.
+
 ## Where it stops
 
-One bug, and it is **not** about Alex — it happens with Fred just the same,
-inside `SEOpenSpeechChannel`, before any voice is chosen:
+Much further along, and now inside real work rather than setup:
 
 ```
-_SEOpenSpeechChannel + 0xe
-  SpeechChannelManager::ISpeechChannelManager + 0x2ba
-    SpeechChannelManager::UseVoice + 0x6fe
-      SLCartDict::SLCartDict + 0x7a
-        SLCartDict::SymtabRead        <- access violation
+TextToPhonemesProcessing + 0x215
+  MT3BEngineTask::ParseNextPhrase
+    MTBEWorker::AddTask
+      MacinTalk + 0xf684        <- access violation, reading 0xffffffff
 ```
 
-The manager's constructor picks a default voice and builds its dictionaries.
-It maps `PrefixDictionary` — the first of the seven, and **the only one ever
-opened** — and constructs an `SLCartDict` over it.
+`0xffffffff` is a sentinel being used as a pointer, which suggests a handle the
+loader hands back as -1 rather than a real object -- the engine's own worker
+and timing machinery is the first suspect, since `mach_host_self`,
+`host_get_io_master` and `mach_msg` are all newly reached and all currently
+answered with placeholders.
 
-That is the wrong class for that file. `SLCartDict`'s constructor reads a
-header word and sets its cursor to `data + 20 + SmartSwapInt32Value(data[0x10])
-+ 1`. `SLDictionary`'s constructor leaves the swap fields at 2 and 1, so the
-swap always happens; `PrefixDictionary` is little-endian, so the value comes
-back as `0x00EA0601` = 15,336,961 and the cursor lands 15,336,982 bytes past a
-1,638,242-byte file. The faulting address matches that arithmetic **to the
-byte**.
-
-`SLPrefixDict` exists in the same binary and is presumably what should have
-been constructed. So the open question is:
-
-> Why does `SpeechChannelManager::UseVoice` build an `SLCartDict` over
-> `PrefixDictionary`, rather than over `CartLite`?
-
-Ruled out already, each by experiment rather than by reasoning:
+Ruled out earlier, each by experiment rather than by reasoning, and all still
+correct:
 
 - **Not the CoreFoundation string lifetime.** Making the object graveyard never
   free changes nothing.
 - **Not a wrong resource path.** All six URLs resolve to their own correct
-  files.
-- **Not CoreFoundation collections.** No stubbed symbol is reached at all
-  before the crash, so no plist or dictionary parsing is involved.
+  files -- and now all four get mapped.
+- **Not CoreFoundation collections.** No stubbed symbol was reached before the
+  old crash, so no plist or dictionary parsing was involved.
 - **Not the external relocations.** All 49 unresolved ones are the three C++
   ABI RTTI vtables, which only `dynamic_cast` and exception matching ever
   dereference.
-
-The next step is to read `UseVoice` around `MacinTalk + 0xac7a` and see which
-URL it hands to `SLMMapCache::Map`.
 
 ## What is still unshimmed
 
