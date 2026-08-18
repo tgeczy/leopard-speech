@@ -89,7 +89,7 @@ def test_a_long_utterance_does_not_poison_the_engine(driver):
 
 def test_only_playable_engines_are_offered(tiger_tree):
     """Whatever reaches the list must be something the host can render."""
-    import tree
+    import leopardtree as tree
     _mt, _sd, voicesdir = tree.engine_paths(tiger_tree)
     offered = tree.read_voices(voicesdir, playable_only=True)
     assert offered, "nothing offered at all"
@@ -104,7 +104,7 @@ def test_vicki_is_withheld_without_an_aac_decoder(tiger_tree, monkeypatch):
     mutes the screen reader for someone who then cannot hear their way back
     out -- so the list has to drop her instead.
     """
-    import tree
+    import leopardtree as tree
     _mt, _sd, voicesdir = tree.engine_paths(tiger_tree)
     with_decoder = tree.read_voices(voicesdir, playable_only=True)
     assert any(e == "meow" for _b, _d, e in with_decoder), \
@@ -113,7 +113,11 @@ def test_vicki_is_withheld_without_an_aac_decoder(tiger_tree, monkeypatch):
     monkeypatch.setattr(tree, "aac_available", lambda: False)
     without = tree.read_voices(voicesdir, playable_only=True)
     assert not any(e == "meow" for _b, _d, e in without)
-    assert len(without) == len(with_decoder) - 1
+    # Leopard has two of them -- Alex as well as Vicki -- where Tiger has only
+    # Vicki, so counting one lost voice was Tiger's arithmetic, not a rule.
+    lost = sum(1 for _b, _d, e in with_decoder if e == "meow")
+    assert lost >= 1
+    assert len(without) == len(with_decoder) - lost
     # And the rest of the list is untouched: one voice lost, not a whole engine.
     assert {b for b, _d, _e in without} == \
         {b for b, _d, e in with_decoder if e != "meow"}
@@ -146,7 +150,10 @@ def test_missing_tree_refuses_to_load_rather_than_going_silent(monkeypatch,
     that offers to open the folder gets exactly the same answer.
     """
     import leopardspeech
-    import tree
+    # `leopardtree`, not `tree`: both add-ons share one sys.modules, and the
+    # rename is exactly what stops this one loading Tiger's copy.  The test
+    # kept the old name and had been failing to import ever since.
+    import leopardtree as tree
     monkeypatch.delenv("LEOPARD_TREE", raising=False)
     monkeypatch.setattr(tree, "config_base", lambda: str(tmp_path))
     assert tree.find_tree() is None
@@ -360,28 +367,45 @@ def test_pitch_changes_the_fundamental(driver):
         seg = [float(x) for x in v[bi:bi + w]]
         m = sum(seg) / len(seg)
         seg = [x - m for x in seg]
+        # Every sample, not every fourth: subsampling a correlation aliases.
         bc, bl = 0.0, 0
         for lag in range(22050 // 500, 22050 // 60):
-            c = sum(seg[i] * seg[i + lag] for i in range(0, len(seg) - lag, 4))
+            c = sum(seg[i] * seg[i + lag] for i in range(0, len(seg) - lag))
             if c > bc:
                 bc, bl = c, lag
         return 22050.0 / bl if bl else 0.0
 
     _warm(driver)
     text = "Hello there, this is a test of the pitch."
-    got = {}
-    for p in (0, 50, 100):
-        driver._set_pitch(p)
-        pcm = driver._render(text, 180, driver._get_voice(),
-                             driver._pitchOffset())
-        assert pcm, "pitch %d produced nothing" % p
-        got[p] = f0(pcm)
-    driver._set_pitch(50)
-    assert got[0] < got[50] < got[100], \
-        "pitch is not monotonic: %r" % got
-    # The ends are an octave either way, so each should be near a factor of two.
-    assert 1.6 < got[50] / got[0] < 2.4, "low end is not about an octave: %r" % got
-    assert 1.6 < got[100] / got[50] < 2.4, "high end is not about an octave: %r" % got
+
+    def sweep(voice):
+        got = {}
+        for p in (0, 50, 100):
+            driver._set_pitch(p)
+            pcm = driver._render(text, 180, voice, driver._pitchOffset())
+            assert pcm, "pitch %d produced nothing for %s" % (p, voice)
+            got[p] = f0(pcm)
+        driver._set_pitch(50)
+        return got
+
+    # Whatever the voice, the slider has to move the voice and move it the
+    # right way.  This is the part that being inert would break.
+    default = sweep(driver._get_voice())
+    assert default[0] < default[50] < default[100], \
+        "pitch is not monotonic on %s: %r" % (driver._get_voice(), default)
+
+    # The octave-either-way claim holds for a *formant* voice, and only there.
+    # Measured through the host, Fred is 71.4 / 143.2 / 279.1 Hz across the
+    # slider -- an octave each way to within a percent -- while Alex, who is
+    # concatenative and pitch-shifts recorded speech instead of retuning an
+    # oscillator, gives 129.7 / 198.6 / 501.1.  This driver defaults to Alex,
+    # so the test inherited from the Tiger add-on was quietly measuring him
+    # and calling a correct driver broken.
+    fred = [b for b, _d, e in driver._voices if b == "Fred"]
+    if fred:
+        got = sweep(fred[0])
+        assert 1.6 < got[50] / got[0] < 2.4, "low end is not an octave: %r" % got
+        assert 1.6 < got[100] / got[50] < 2.4, "high end is not an octave: %r" % got
 
 
 def test_embedded_commands_are_off_by_default(driver):
@@ -483,3 +507,109 @@ def test_every_wx_name_we_use_actually_exists_in_wxpython():
         "these wx names are not in the allowed set. Check they exist in "
         "wxPython -- YES_NO_CANCEL does not -- then add them here: %r"
         % unknown)
+
+
+def _speakAndWait(driver, seq, timeout=25.0):
+    """Speak one sequence and wait for it to finish, -> (feeds, bytes)."""
+    import synthDriverHandler
+    before = synthDriverHandler.synthDoneSpeaking.count
+    fed0, bytes0 = driver._player.fed, driver._player.bytes
+    driver.speak(seq)
+    end = time.perf_counter() + timeout
+    while time.perf_counter() < end:
+        if synthDriverHandler.synthDoneSpeaking.count > before:
+            break
+        time.sleep(0.005)
+    else:
+        raise AssertionError("the sequence never finished speaking")
+    return driver._player.fed - fed0, driver._player.bytes - bytes0
+
+
+def test_adjacent_text_is_one_utterance_not_several(driver):
+    """A line with a link in it is one sentence, and must sound like one.
+
+    NVDA puts an IndexCommand only where a callback sits or an utterance ends
+    -- speech/manager.py -- so the pieces of a web page line arrive as plain
+    adjacent strings.  Rendering each on its own gave every fragment the
+    falling intonation of a finished sentence, which two testers reported as
+    the speech pausing before every link.
+    """
+    _warm(driver)
+    feeds, _b = _speakAndWait(driver, ["Read more about it ", "link", "Home"])
+    assert feeds == 1, "each fragment was still rendered on its own (%d feeds)" % feeds
+
+
+def test_an_index_still_splits_the_utterance_and_is_reported(driver):
+    """Joining must not swallow the boundaries NVDA actually asked for."""
+    import speech.commands
+    import synthDriverHandler
+    _warm(driver)
+    before = synthDriverHandler.synthIndexReached.count
+    feeds, _b = _speakAndWait(driver, ["first part ",
+                                       speech.commands.IndexCommand(7),
+                                       "second part"])
+    assert feeds == 2, "the index did not split the audio (%d feeds)" % feeds
+    assert synthDriverHandler.synthIndexReached.count > before, "index lost"
+
+
+def test_a_break_command_becomes_real_silence(driver):
+    """NVDA asking for a pause in so many words was dropped until now."""
+    import speech.commands
+    import leopardspeech
+    _warm(driver)
+    _f1, plain = _speakAndWait(driver, ["one", "two"])
+    _f2, withGap = _speakAndWait(driver, ["one",
+                                          speech.commands.BreakCommand(300),
+                                          "two"])
+    want = len(leopardspeech._silence(300))
+    assert withGap >= plain + want * 0.8, (
+        "a 300 ms break added %d bytes, expected about %d" % (withGap - plain, want))
+
+
+def test_the_pause_setting_lengthens_the_gaps(driver):
+    """The knob two testers asked for, in both directions."""
+    import leopardspeech
+    _warm(driver)
+    driver._set_pauseMode("short")
+    _f, short = _speakAndWait(driver, ["alpha", "beta"])
+    driver._set_pauseMode("long")
+    _f, long_ = _speakAndWait(driver, ["alpha", "beta"])
+    driver._set_pauseMode("short")
+    assert long_ > short, "'long' produced no more audio than 'short'"
+    assert leopardspeech.SynthDriver.PAUSE_MS["short"] == 0
+
+
+def test_fragments_are_joined_without_gluing_words_together(driver):
+    """"link" then "Home" must not reach the engine as "linkHome"."""
+    import leopardspeech
+    join = leopardspeech._joinFragments
+    assert join(["link", "Home"]) == "link Home"
+    assert join(["Read more about it ", "here"]) == "Read more about it here"
+    assert join([" on our site.", " Next"]) == " on our site. Next"
+    assert join(["only"]) == "only"
+
+
+def test_typographic_characters_reach_the_engine_as_macroman():
+    """The engine's text is a single-byte Mac encoding, not UTF-8."""
+    import leopardspeech
+    enc = leopardspeech._encode
+    assert enc(u"—") == b"\xd1"
+    assert enc(u"–") == b"\xd0"
+    assert enc(u"“") == b"\xd2"
+    assert enc(u"”") == b"\xd3"
+    assert enc(u"…") == b"\xc9"
+    assert enc(u"café") == b"caf\x8e"
+    assert enc(u"Is it?") == b"Is it?"
+    assert b"?" not in enc(u"你好")
+    assert enc(u"你好") == b"  "
+
+
+def test_the_driver_actually_uses_that_encoder():
+    """An encoder that is never called is exactly as broken as no encoder."""
+    import io
+    import os
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "addon", "synthDrivers", "leopardspeech.py")
+    src = io.open(path, encoding="utf-8").read()
+    assert "t = _encode(text)" in src, "the request no longer encodes the text"
+    assert 't = text.encode("utf-8")' not in src, "still sending UTF-8"
