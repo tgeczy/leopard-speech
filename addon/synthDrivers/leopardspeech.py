@@ -237,6 +237,9 @@ class SynthDriver(SynthDriver):
         self._proc = None
         self._procLock = threading.Lock()
         self._stopped = False
+        #: Bumped by cancel(). Read by the worker *after* it takes an item off
+        #: the queue, and checked again once the render returns -- see _run().
+        self._epoch = 0
         self._queue = queue.Queue()
         self._audioQueue = queue.Queue()
         self._player = self._makePlayer()
@@ -403,26 +406,42 @@ class SynthDriver(SynthDriver):
 
     # -- threads -----------------------------------------------------------
     def _run(self):
-        """Render each utterance and hand it on.  Nothing is stamped.
+        """Render each utterance and hand it on.
 
         Reconcile the settings here rather than taking them as queued events:
         `cancel()` drains this queue, and NVDA cancels between changing a
         setting and speaking the confirmation of it, so a queued voice change
         would be eaten and the confirmation spoken in the old voice.
+
+        **The epoch check is why an utterance is not spoken after it was
+        cancelled.** `cancel()` empties both queues, but it cannot reach the
+        one utterance already being rendered, and that render blocks: Alex
+        takes about 185 ms for a file name, against 15 to 40 for Fred. Arrowing
+        down a list faster than that, every item you hear is the previous one,
+        which sounds like the synthesizer reading the same thing over and over.
+
+        The stamp is taken **after** the item is dequeued, not when it was
+        queued. That distinction matters: an earlier attempt stamped at queue
+        time and compared at render time, so a cancel arriving anywhere in that
+        window made an item stale, and it reached a state where every item was
+        stale and the synthesizer never spoke again. Here an item is dropped
+        only if a cancel arrived during its own render -- so once the cancels
+        stop, the very next item is spoken.
         """
         while not self._stopped:
             item = self._queue.get()
             if item is None:
                 break
+            epoch = self._epoch
             wpm, voice, pitch = self._wpm(), self._voiceId, self._pitchOffset()
             for kind, value in item:
-                if self._stopped:
+                if self._stopped or self._epoch != epoch:
                     break
                 if kind == "index":
                     self._audioQueue.put(("index", value))
                     continue
                 pcm = self._render(value, wpm, voice, pitch)
-                if pcm:
+                if pcm and self._epoch == epoch:
                     self._audioQueue.put(("audio", pcm))
             self._audioQueue.put(("done", None))
 
@@ -470,6 +489,7 @@ class SynthDriver(SynthDriver):
         ungated, because a flag that tracked whether the *worker* was busy once
         left interruption silently broken while sound was still playing.
         """
+        self._epoch += 1
         for q in (self._queue, self._audioQueue):
             while True:
                 try:
