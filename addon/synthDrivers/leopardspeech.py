@@ -400,6 +400,16 @@ class SynthDriver(SynthDriver):
         #: Bumped by cancel(). Read by the worker *after* it takes an item off
         #: the queue, and checked again once the render returns -- see _run().
         self._epoch = 0
+        #: Whether the bundled host understands a streamed request.
+        #:
+        #: It ships with this file, so it always should -- and when it did not,
+        #: during development, this add-on went completely silent: the host
+        #: refuses 'TGR4' and exits, the driver respawns it and asks again, for
+        #: every utterance, for ever.  An add-on update whose executable failed
+        #: to copy would do the same on a real machine.  One refusal turns
+        #: streaming off and says why; the old request works against every host
+        #: that has ever existed.
+        self._streaming = True
         self._queue = queue.Queue()
         self._audioQueue = queue.Queue()
         self._player = self._makePlayer()
@@ -587,11 +597,12 @@ class SynthDriver(SynthDriver):
             proc = self._host()
             v = voice.encode("utf-8")
             t = _encode(text)
-            req = REQ_MAGIC_STREAM if sink is not None else REQ_MAGIC
+            streaming = sink is not None and self._streaming
+            req = REQ_MAGIC_STREAM if streaming else REQ_MAGIC
             proc.stdin.write(struct.pack("<IiiIII", req, wpm, pitch,
                                          0, len(v), len(t)) + v + t)
             proc.stdin.flush()
-            if sink is None:
+            if not streaming:
                 magic, status, nframes = struct.unpack(
                     "<IiI", _readExactly(proc.stdout, 12))
                 if magic != RSP_MAGIC:
@@ -600,6 +611,13 @@ class SynthDriver(SynthDriver):
                 if status:
                     log.debugWarning("leopardspeech: OSErr %d for %r"
                                      % (status, text))
+                if sink is not None:
+                    # Streaming is off, but the caller still expects its audio
+                    # through the sink.  One chunk: the whole utterance, which
+                    # is what this driver did before it streamed.
+                    if pcm:
+                        sink(pcm)
+                    return b""
                 return pcm
             # Streamed.  The status arrives first, because SESpeakBuffer
             # returns in a tenth of a millisecond and the outcome is known long
@@ -637,6 +655,18 @@ class SynthDriver(SynthDriver):
                     except Exception:
                         pass
                     self._proc = None
+            if sink is not None and self._streaming:
+                # A host that does not know 'TGR4' exits rather than answer it,
+                # which arrives here as a closed pipe.  Left alone this repeats
+                # for every utterance -- respawn, refuse, respawn -- and the
+                # user hears nothing at all, ever.  This actually happened
+                # here, with an executable one build out of date.  So stop
+                # asking, and say so where somebody will see it.
+                self._streaming = False
+                log.warning("leopardspeech: the bundled engine does not "
+                            "understand streamed audio, which means its files "
+                            "are older than this driver -- reinstall the "
+                            "add-on. Speaking the previous way instead.")
             return None
 
     # -- threads -----------------------------------------------------------
@@ -760,6 +790,12 @@ class SynthDriver(SynthDriver):
             return True
 
         pcm = self._render(text, wpm, voice, self._pitchOffset(adj), sink=sink)
+        if pcm is None and not fed and not self._streaming:
+            # That failure was the host refusing to stream, and it has just
+            # been turned off.  Say this utterance the old way rather than
+            # losing it -- it could be the one telling the user what happened.
+            pcm = self._render(text, wpm, voice, self._pitchOffset(adj),
+                               sink=sink)
         if pcm is not None and fed and self._epoch == epoch:
             gap = self.PAUSE_MS.get(self._pauseMode, 0)
             if gap:

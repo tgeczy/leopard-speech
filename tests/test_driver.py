@@ -942,3 +942,29 @@ def test_cancel_during_a_streamed_utterance_leaves_the_engine_usable(driver):
     time.sleep(0.5)
     _feeds, spoken = _speakAndWait(driver, ["still here"])
     assert spoken > 0, "the driver went silent after cancelling a stream"
+
+
+def test_an_engine_that_cannot_stream_still_speaks(driver, monkeypatch):
+    """New driver, old engine: the one combination that did go silent.
+
+    This is not hypothetical here.  The first run of these tests after the
+    driver learnt to stream produced no audio at all, because the bundled
+    `leopard_host.exe` was one build out of date: it refuses 'TGR4' and
+    exits, the driver sees a closed pipe and respawns it, and asks again --
+    for every utterance, for ever.  An add-on update whose executable failed
+    to copy does exactly that on a real machine.
+
+    Simulated by asking for a magic no host will ever know.  The driver must
+    notice, stop asking, say so where somebody will see it, and speak.
+    """
+    import leopardspeech
+    _warm(driver)
+    monkeypatch.setattr(leopardspeech, "REQ_MAGIC_STREAM", 0x54475239)
+    assert driver._streaming, "streaming should start on"
+
+    _feeds, spoken = _speakAndWait(driver, ["can you still hear me"])
+    assert spoken > 0, "a host that cannot stream left the driver silent"
+    assert not driver._streaming, "it kept asking for a request it was refused"
+
+    _feeds, again = _speakAndWait(driver, ["and again"])
+    assert again > 0, "it spoke once and then went silent"
