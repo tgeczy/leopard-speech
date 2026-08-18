@@ -25,8 +25,8 @@ it. Forked, that fix would have had to be found twice.
 |---|---|
 | the loader, the shims, the host | **tiger-speech**, `src/` |
 | the Mach-O dissection tools | **tiger-speech**, `tools/` |
-| Tiger's driver, voice list, extractor | tiger-speech |
-| Leopard's driver, voice list, and this document | here |
+| Tiger's driver, voice list and extractor | tiger-speech |
+| Leopard's driver, voice list and extractor | here, `tools/extract_leopard.py` |
 
 Clone them as siblings, because `build.sh` looks next door for the loader:
 
@@ -318,11 +318,22 @@ ellipsis, so encoding properly is the whole fix.
 
 The same rule as tiger-speech, and it is not a formality: **no part of Apple's
 software will ever be distributed here.** You supply your own Leopard install
-and take the engine out of it yourself.
+disc and the extractor takes the engine out of it:
 
-**There is no automated extractor here yet** — tiger-speech has one,
-`tools/extract_tiger.py`, and the equivalent for Leopard is not written. What
-follows is the layout it will use, and what to copy by hand meanwhile.
+```
+py -3 tools/extract_leopard.py "Mac OS X Leopard Install DVD.iso"
+```
+
+That writes to `%APPDATA%\nvda\leopard-data`, which is where the add-on looks.
+It takes about ten seconds and produces **all twenty-four voices**, Alex
+included. `--no-voices` gets you the engine, the dictionary and Fred in a few
+megabytes, which is enough to confirm it works before committing to Alex's
+701 MB. `--out` puts it somewhere else.
+
+Verified the strict way: a tree extracted straight from the DVD renders
+**byte-for-byte identical audio** to one assembled by hand.
+
+### Why that is not four lines of 7-Zip
 
 The install DVD hides its filesystem behind a small ISO9660 boot partition, so
 a plain listing shows only the Boot Camp documentation. The real one is an APM
@@ -335,29 +346,48 @@ partition map:
   Mac_OS_X.hfs                  7,634,907,136   <- everything is in here
 ```
 
-Inside that HFS volume, the engine and Fred are live on the DVD under
-`System/Library/Speech/`; the remaining voices are inside `Essentials.pkg` and
-the 707 MB `AdditionalSpeechVoices.pkg`, and `libstdc++.6.0.4.dylib` is at
-`usr/lib`. Note the packages are **cpio, not tar**, which is the trap that
-caught the Tiger extractor first.
-
-Arrange what you take out like this, in `%APPDATA%\nvda\leopard-data`:
+Inside that HFS volume the engine, the dictionary and **Fred** are live, so
+the smallest useful extraction needs no package handling at all:
 
 ```
-leopard-data\
-  Speech\
-    Synthesizers\MacinTalk.SpeechSynthesizer\Contents\MacOS\MacinTalk
-    Voices\<Name>.SpeechVoice\...
-  SpeechDictionary.framework\Versions\A\
-  libstdc++.6.0.4.dylib
-  libstdc++.6.dylib
+System/Library/Speech/Synthesizers/MacinTalk.SpeechSynthesizer/
+System/Library/Speech/Voices/Fred.SpeechVoice/
+System/Library/PrivateFrameworks/SpeechDictionary.framework/
+usr/lib/libstdc++.6.0.4.dylib
 ```
 
-The add-on offers to open that folder for you if it cannot find one, and says
-exactly which piece is missing rather than simply not appearing in the
-synthesizer list. `Speech\Voices` is what it probes for, and the voice list is
-built from whatever is actually there — so you can start with Fred alone, about
-33 MB, and add Alex's 670 MB once it works.
+7-Zip can list that partition map, and it can read an HFS volume that is a
+file on its own — but it cannot be pointed at a partition *inside* another
+file, and it will not read HFS from a pipe. The alternative was to copy 7.6 GB
+out to a temporary file first, so the extractor reads the HFS+ catalogue
+itself, at the offset the partition map gives, and touches only the bytes it
+needs. The catalogue is a B-tree; rather than implement HFS+'s
+case-insensitive Unicode key ordering, which is fiddly and easy to get subtly
+wrong, it walks every leaf node and builds the tree in memory. About 49,000
+records, under a second.
+
+The remaining voices come out of packages, and they are split across two of
+them in a way the names actively mislead about:
+
+| package | holds |
+|---|---|
+| `AdditionalSpeechVoices.pkg` | Alex and Vicki only — but 707 MB of them |
+| `Essentials.pkg` | the twenty-two classic MacinTalk 3 voices |
+
+Take only the first, which its name invites, and you get Alex while losing
+Agnes, Bruce, Victoria and every singing voice. That was found by reading each
+package's bill of materials — a small bzip2 member in the same archive, with
+the voice names as plain strings inside it — rather than by streaming all
+forty of them.
+
+Leopard uses **flat** packages, unlike Tiger's bundles: a `.pkg` is a `xar`
+archive whose `Payload` member is a gzip stream, and inside that is **cpio**,
+in the old `070707` portable ASCII format. Not tar — `tarfile` rejects it
+outright, and that is the trap that caught the Tiger extractor first.
+
+The add-on offers to open the data folder for you if it cannot find one, and
+says exactly which piece is missing rather than simply not appearing in the
+synthesizer list.
 
 ## Licence
 
