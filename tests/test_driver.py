@@ -1069,3 +1069,55 @@ def test_audio_from_a_cancelled_utterance_is_dropped_by_the_feeder(driver):
     while time.perf_counter() < end and driver._player.bytes == before:
         time.sleep(0.005)
     assert driver._player.bytes > before, "current audio was dropped too"
+
+
+def test_volume_comes_back_after_being_taken_to_zero(driver):
+    """A user found this, and it is the worst failure this driver has.
+
+    `[[volm]]` sets state on the speech channel and it outlives the utterance
+    that set it, so sending nothing at 100 did not mean "full volume", it
+    meant "whatever was set last".  Home to 0 and End back to 100 left the
+    synthesizer permanently silent; only 99 brought it back, because 99 is
+    the one value that still sends a command.
+    """
+    import struct as _s
+
+    def level(pcm):
+        if not pcm:
+            return 0.0
+        v = _s.unpack("<%dh" % (len(pcm) // 2), pcm)
+        return (sum(x * x for x in v) / float(len(v))) ** 0.5
+
+    voice = driver._get_voice()
+    driver._set_volume(100)
+    full = level(driver._render("testing one two three", 180, voice))
+    driver._set_volume(0)
+    driver._render("testing one two three", 180, voice)
+    driver._set_volume(100)
+    back = level(driver._render("testing one two three", 180, voice))
+    assert back > full * 0.5, (
+        "volume did not come back: %.1f against %.1f at full" % (back, full))
+
+
+def test_inflection_comes_back_to_the_middle_too(driver, monkeypatch):
+    """The same trap, one setting over: 'pmod' is channel state as well."""
+    import leopardspeech
+    voice = driver._get_voice()
+    driver._set_inflection(0)
+    driver._render("testing one two three", 180, voice)
+
+    seen = []
+    original = leopardspeech._encode
+    monkeypatch.setattr(leopardspeech, "_encode",
+                        lambda t: (seen.append(t), original(t))[1])
+    driver._set_inflection(50)
+    driver._render("testing one two three", 180, voice)
+    assert seen and "[[pmod 100]]" in seen[0], (
+        "returning to the middle sent nothing, so the engine stays flat: %r"
+        % (seen,))
+
+    del seen[:]
+    driver._render("testing one two three", 180, voice)
+    assert seen and "[[pmod" not in seen[0], (
+        "the command is still being sent after the setting came back: %r"
+        % (seen,))
