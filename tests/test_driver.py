@@ -740,3 +740,22 @@ def test_a_typographic_apostrophe_is_an_apostrophe():
     # Curly *double* quotes stay: those really are quotation marks, and the
     # engine is right to treat them as such.
     assert enc(u"“quoted”") == b"\xd2quoted\xd3"
+
+
+def test_a_string_that_crashes_the_engine_does_not_silence_the_synthesizer(driver):
+    """A tester found one: "U" followed by about fifty p's.
+
+    It faults inside Apple's own code -- MacinTalk + 0x3aed1, reached from
+    MTMBSegmentProducer::LoadUnit, which is the concatenative unit loader --
+    so it is Alex's path, Fred survives it, and there is nothing to fix on
+    this side of the engine.
+
+    What must never follow is silence.  The host dies, the driver notices the
+    broken exchange, drops the process and starts a fresh one, and the next
+    utterance speaks.  Losing one utterance to Apple's bug is a nuisance;
+    losing the screen reader is the failure this driver exists to avoid.
+    """
+    _warm(driver)
+    driver._render("U" + "p" * 60, 180, driver._get_voice())
+    spoke = driver._render("testing", 180, driver._get_voice())
+    assert spoke, "the synthesizer never spoke again after the engine crashed"
