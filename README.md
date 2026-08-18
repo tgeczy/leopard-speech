@@ -97,34 +97,65 @@ Two smaller traps came with it:
 - **A spilled PIC base looks exactly like a return address**, which is already
   written down in the loader's notes and caught nobody by surprise this time.
 
-## Where it stops
+## Where it is now: Alex speaks
 
-Inside real work now, and waiting on two things that are ours to supply.
+Confirmed by ear on 2026-08-18. He counts to seven, and he is unmistakably
+Alex. What remains is a crackle laid over the speech and a doubled initial
+consonant here and there — "thtree" for "three".
 
-```
-MacinTalk + 0x1f4a2          test dword ptr [esi+0x1c], eax
-                             <- esi is null
-```
+Getting there needed four things, and three of them were the loader's fault
+rather than the engine's.
 
-Immediately before it, the engine reaches `sqlite3_open`, `sqlite3_prepare`,
-`sqlite3_bind_text`, `sqlite3_step`, `sqlite3_reset` and `__dynamic_cast` --
-every one of them a stub that answers zero. A `__dynamic_cast` that returns
-null means "this object is not of that type", which is a legitimate answer the
-engine does not check, so the null it is handed is the null it dereferences.
+**Accelerate.** Alex is concatenative, so changing his rate means time-scaling
+recorded speech rather than re-running a model. `MTMBModRateWsola` does it with
+WSOLA — waveform similarity overlap-add — and WSOLA is a search. Apple sent the
+search to vDSP, and with those stubbed Alex ran to completion and produced one
+frame of nothing. Nothing failed; the only evidence was a counter reading
+58,186,903 calls into an empty function. The signatures were counted off the
+call sites rather than remembered, which mattered: `vDSP_vmsb` takes nine
+arguments and computes `A*B − C`, `vDSP_vmma` takes eleven and computes
+`A*B + C*D`, and `vmul` is vecLib's older seven-argument spelling.
 
-So the next two pieces are:
+**Alex is AAC**, like Vicki — but fetched completely differently. The engine
+maps only the first 77,114,248 bytes of his 701 MB bank, which is the index and
+is exactly the value at `+0x28` of the `meow` header, then `pread`s each
+waveform grain out of the remaining 624 MB. That is Apple loading it
+chunk-by-chunk, visible in the log.
 
-- **sqlite3.** Public domain, so the amalgamation compiles straight in. Eight
-  entry points.
-- **`__dynamic_cast`, and the RTTI it needs.** The 49 unresolved external
-  relocations are the three C++ ABI class vtables, and the old note here said
-  only `dynamic_cast` and exception matching would ever dereference them. That
-  is still true and no longer reassuring, because `dynamic_cast` is now
-  reached. The clean answer is to load Leopard's own
-  `/usr/lib/libstdc++.6.dylib` as a third image with the same loader: it
-  supplies `__dynamic_cast`, the RTTI vtables and the thirteen libstdc++
-  symbols in one go, and it is the only way to get GCC 4.0.1's copy-on-write
-  `basic_string` layout exactly right.
+**So two things written for Vicki are wrong for him.** `aac_flush_delay`
+re-feeds the last packet to shake loose the frame Windows 7's decoder holds
+back; on one long stream the duplicates land past the end, but on Alex the
+packet *is* the payload and it arrived three times over. And the priming must
+not be trimmed — Apple sets `kAudioConverterPrimeMethod` to None, so taking
+Vicki's 2112 samples off a 1024-sample refill deletes it outright.
+
+**And the decoder has to stay open.** `aac_begin()` sends `COMMAND_FLUSH`, and
+AAC frames overlap: a frame is not finished until the next one's window is
+added to it. Flushing between packets left a seam at every 1024-sample
+boundary, which is audibly a stutter — one gap per frame. One packet in also
+yields nothing out, so a refill has to keep pulling until the decoder gives
+something back.
+
+### What the remaining crackle is not
+
+Measured, so that the next attempt does not start from the same four guesses:
+
+- **Not a framing seam.** The largest sample-to-sample jumps are not periodic
+  at 229 (our slice size), 256, 512, 1024 (an AAC frame) or 2048 — no offset
+  holds more than 6% of them.
+- **Not clipping.** Peak 13638 of 32767.
+- **Not the output format.** The engine asks for `'lpcm'` flags 0x0c — signed,
+  packed, little-endian, 16-bit — which is exactly what the decoder produces.
+- **Not a `pread` race.** Made atomic anyway; the render is byte-identical.
+- **Not nondeterminism.** Two runs byte-identical.
+
+It looks like broadband noise laid over the speech: around each large jump the
+samples alternate sign at high amplitude, and Alex measures three times rougher
+than Fred through the same output path. The next two suspects are the WSOLA
+semantics — the argument *shapes* are confirmed from the binary, the *meanings*
+only inferred — and the engine's own scheduling clock, since
+`MTBEAudioUnitSoundOutput::QueueSamples` turns timestamps into sample positions
+and the host completes slices faster than real time.
 
 ## The stack alignment nobody can skip
 
