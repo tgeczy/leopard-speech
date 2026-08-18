@@ -237,6 +237,7 @@ class SynthDriver(SynthDriver):
         SynthDriver.VoiceSetting(),
         SynthDriver.RateSetting(),
         SynthDriver.PitchSetting(),
+        SynthDriver.VolumeSetting(),
         BooleanDriverSetting(
             "acceptCommands",
             _("Accept &embedded speech commands in text"),
@@ -249,7 +250,8 @@ class SynthDriver(SynthDriver):
         ),
     )
     supportedCommands = {speech.commands.IndexCommand,
-                         speech.commands.BreakCommand}
+                         speech.commands.BreakCommand,
+                         speech.commands.PitchCommand}
     supportedNotifications = {synthIndexReached, synthDoneSpeaking}
 
     @classmethod
@@ -294,6 +296,7 @@ class SynthDriver(SynthDriver):
         self._pitch = 50
         self._acceptCommands = False
         self._pauseMode = "short"
+        self._volume = 100
         self._voiceId = self._voices[0][0]
         # Prefer Alex, then Fred. Alex is the reason this add-on exists, and
         # anyone installing it who has him almost certainly wants him; Fred is
@@ -432,9 +435,17 @@ class SynthDriver(SynthDriver):
     def _wpm(self):
         return RATE_MIN + int(self._rate * (RATE_MAX - RATE_MIN) / 100)
 
-    def _pitchOffset(self):
-        """-> tenths of a semitone away from the voice's own pitch."""
-        return int((self._pitch - 50) * PITCH_SEMITONES * 10 / 50)
+    def _pitchOffset(self, adj=0):
+        """-> tenths of a semitone away from the voice's own pitch.
+
+        `adj` is what NVDA asked for on top of the user's setting, on its
+        own 0-100 scale: a PitchCommand carrying the "capital pitch change
+        percentage", which is how a capital letter is meant to be marked.
+        The driver used to drop those commands, so that setting did
+        nothing at all no matter what it was set to.
+        """
+        pitch = min(100, max(0, self._pitch + adj))
+        return int((pitch - 50) * PITCH_SEMITONES * 10 / 50)
 
     def _render(self, text, wpm, voice, pitch=0):
         """-> PCM bytes, or None.  One request, one utterance."""
@@ -453,6 +464,15 @@ class SynthDriver(SynthDriver):
             # produce silence instead of speaking it.  The host separately
             # guarantees no command can outlive its utterance.
             text = COMMAND_RE.sub("", text)
+        # Volume is the engine's own [[volm]] command, not gain applied to
+        # the PCM afterwards.  Measured on both engines it is exactly
+        # linear -- volm 0.5 halves the RMS and 0.2 fifths it -- so the
+        # synthesizer does the arithmetic in floating point before it
+        # quantises, which is better than anything done to 16-bit samples
+        # after the fact.  Nothing is added at full volume, so the default
+        # request is byte-for-byte what it always was.
+        if self._volume < 100:
+            text = "[[volm %.3f]]%s" % (self._volume / 100.0, text)
         try:
             proc = self._host()
             v = voice.encode("utf-8")
@@ -518,7 +538,11 @@ class SynthDriver(SynthDriver):
             if item is None:
                 break
             epoch = self._epoch
-            wpm, voice, pitch = self._wpm(), self._voiceId, self._pitchOffset()
+            wpm, voice = self._wpm(), self._voiceId
+            #: What NVDA has asked us to add to the user's pitch for the
+            #: text that follows -- how "capital pitch change percentage"
+            #: is expressed.  0 means the user's own setting.
+            adj = 0
             run = []
             for kind, value in item:
                 if self._stopped or self._epoch != epoch:
@@ -526,16 +550,18 @@ class SynthDriver(SynthDriver):
                 if kind == "text":
                     run.append(value)
                     continue
-                self._flush(run, wpm, voice, pitch, epoch)
+                self._flush(run, wpm, voice, adj, epoch)
                 if kind == "index":
                     self._audioQueue.put(("index", value))
                 elif kind == "break":
                     self._audioQueue.put(("audio", _silence(value)))
+                elif kind == "pitch":
+                    adj = value
             if not self._stopped and self._epoch == epoch:
-                self._flush(run, wpm, voice, pitch, epoch)
+                self._flush(run, wpm, voice, adj, epoch)
             self._audioQueue.put(("done", None))
 
-    def _flush(self, run, wpm, voice, pitch, epoch):
+    def _flush(self, run, wpm, voice, adj, epoch):
         """Render the text collected so far as ONE utterance.
 
         **Adjacent strings in a speech sequence are not separate utterances.**
@@ -555,7 +581,7 @@ class SynthDriver(SynthDriver):
             return
         text = _joinFragments(run)
         del run[:]
-        pcm = self._render(text, wpm, voice, pitch)
+        pcm = self._render(text, wpm, voice, self._pitchOffset(adj))
         if pcm and self._epoch == epoch:
             self._audioQueue.put(("audio", pcm))
             gap = self.PAUSE_MS.get(self._pauseMode, 0)
@@ -597,6 +623,12 @@ class SynthDriver(SynthDriver):
                 # until now, which meant the one place a pause was *wanted*
                 # was the one place it did not happen.
                 items.append(("break", item.time))
+            elif isinstance(item, speech.commands.PitchCommand):
+                # How NVDA marks a capital letter: an offset on its own
+                # 0-100 pitch scale, 0 meaning the user's setting again.
+                # Dropped until now, so "capital pitch change percentage"
+                # did nothing whatever it was set to.
+                items.append(("pitch", item.offset))
         self._queue.put(items)
 
     def cancel(self):
@@ -651,6 +683,12 @@ class SynthDriver(SynthDriver):
             pass
 
     # -- settings ----------------------------------------------------------
+    def _get_volume(self):
+        return self._volume
+
+    def _set_volume(self, value):
+        self._volume = max(0, min(100, int(value)))
+
     def _get_acceptCommands(self):
         return self._acceptCommands
 
