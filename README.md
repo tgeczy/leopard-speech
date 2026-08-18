@@ -99,33 +99,52 @@ Two smaller traps came with it:
 
 ## Where it stops
 
-Much further along, and now inside real work rather than setup:
+Inside real work now, and waiting on two things that are ours to supply.
 
 ```
-TextToPhonemesProcessing + 0x215
-  MT3BEngineTask::ParseNextPhrase
-    MTBEWorker::AddTask
-      MacinTalk + 0xf684        <- access violation, reading 0xffffffff
+MacinTalk + 0x1f4a2          test dword ptr [esi+0x1c], eax
+                             <- esi is null
 ```
 
-`0xffffffff` is a sentinel being used as a pointer, which suggests a handle the
-loader hands back as -1 rather than a real object -- the engine's own worker
-and timing machinery is the first suspect, since `mach_host_self`,
-`host_get_io_master` and `mach_msg` are all newly reached and all currently
-answered with placeholders.
+Immediately before it, the engine reaches `sqlite3_open`, `sqlite3_prepare`,
+`sqlite3_bind_text`, `sqlite3_step`, `sqlite3_reset` and `__dynamic_cast` --
+every one of them a stub that answers zero. A `__dynamic_cast` that returns
+null means "this object is not of that type", which is a legitimate answer the
+engine does not check, so the null it is handed is the null it dereferences.
 
-Ruled out earlier, each by experiment rather than by reasoning, and all still
-correct:
+So the next two pieces are:
 
-- **Not the CoreFoundation string lifetime.** Making the object graveyard never
-  free changes nothing.
-- **Not a wrong resource path.** All six URLs resolve to their own correct
-  files -- and now all four get mapped.
-- **Not CoreFoundation collections.** No stubbed symbol was reached before the
-  old crash, so no plist or dictionary parsing was involved.
-- **Not the external relocations.** All 49 unresolved ones are the three C++
-  ABI RTTI vtables, which only `dynamic_cast` and exception matching ever
-  dereference.
+- **sqlite3.** Public domain, so the amalgamation compiles straight in. Eight
+  entry points.
+- **`__dynamic_cast`, and the RTTI it needs.** The 49 unresolved external
+  relocations are the three C++ ABI class vtables, and the old note here said
+  only `dynamic_cast` and exception matching would ever dereference them. That
+  is still true and no longer reassuring, because `dynamic_cast` is now
+  reached. The clean answer is to load Leopard's own
+  `/usr/lib/libstdc++.6.dylib` as a third image with the same loader: it
+  supplies `__dynamic_cast`, the RTTI vtables and the thirteen libstdc++
+  symbols in one go, and it is the only way to get GCC 4.0.1's copy-on-write
+  `basic_string` layout exactly right.
+
+## The stack alignment nobody can skip
+
+Worth its own heading, because it is invisible until it is not, and it applies
+to any Darwin i386 code run on Windows.
+
+**Darwin's i386 ABI requires ESP to be 16-byte aligned at every call
+instruction. Windows requires four.** Apple's compiler used the guarantee:
+`MTBEWorker::Timestamp` stores a pair of doubles into its own frame with
+`movapd`, which faults outright when the address is not 16-byte aligned.
+
+Inside the engine it can never break, because every frame preserves the
+alignment it was given. It breaks wherever the host hands control over, and a
+thread entry point is the worst case -- the alignment a Windows thread starts
+with is neither ours to choose nor the same on every run. Leopard's engine
+starts two MP tasks and died at the first `movapd` one of them reached, with
+`ebp-0x18` sitting at 8 mod 16.
+
+Tiger never showed this. That is not evidence it was safe; it is one compiler
+declining to vectorise one function.
 
 ## What is still unshimmed
 
