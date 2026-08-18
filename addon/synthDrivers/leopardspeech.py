@@ -66,6 +66,7 @@ import struct
 import sys
 import subprocess
 import threading
+import time
 import queue
 
 import nvwave
@@ -781,10 +782,18 @@ class SynthDriver(SynthDriver):
                 self._audioQueue.put(("index", index))
             del pending[:]
         fed = []
+        # What the user actually waits, measured where they wait it.  The two
+        # numbers are different questions: how long until the first sound, and
+        # how long the whole utterance took.  Streaming separated them --
+        # before it, they were the same number.
+        started = time.perf_counter()
+        firstAt = []
 
         def sink(chunk):
             if self._stopped or self._epoch != epoch:
                 return False        # interrupted: stop feeding, keep reading
+            if not firstAt:
+                firstAt.append(time.perf_counter())
             fed.append(len(chunk))
             self._audioQueue.put(("audio", chunk))
             return True
@@ -796,6 +805,21 @@ class SynthDriver(SynthDriver):
             # losing it -- it could be the one telling the user what happened.
             pcm = self._render(text, wpm, voice, self._pitchOffset(adj),
                                sink=sink)
+        # Timing, at DEBUG, because "it lags on long text" is the report this
+        # add-on gets most and it was never possible to check from a log.  Both
+        # numbers, per utterance: a first sound that arrives late is a
+        # different fault from an utterance that takes a long time in total,
+        # and with Alex the second is expected -- he renders far more audio per
+        # character than anything else here.
+        if fed and log.isEnabledFor(log.DEBUG):
+            done = time.perf_counter()
+            frames = sum(fed) / 2.0
+            log.debug("leopardspeech: %d chars -> %.2f s of audio in %d "
+                      "chunk(s); first sound after %.0f ms, all of it by "
+                      "%.0f ms"
+                      % (len(text), frames / OUT_RATE, len(fed),
+                         (firstAt[0] - started) * 1000.0,
+                         (done - started) * 1000.0))
         if pcm is not None and fed and self._epoch == epoch:
             gap = self.PAUSE_MS.get(self._pauseMode, 0)
             if gap:
