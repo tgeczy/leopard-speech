@@ -1,14 +1,54 @@
 # Leopard-speech
 
-**It does not speak yet — but the engine loads, opens a speech channel,
-accepts a voice and runs its own worker threads.** This is where Mac OS X 10.5
-Leopard's speech engine will live once it makes a sound, and with it **Alex**,
-which is the voice people actually want.
+**Alex speaks, and he speaks cleanly.** Mac OS X 10.5 Leopard's speech engine
+running as native x86 code inside NVDA — no emulator, no virtual machine — and
+with it **Alex**, which is the voice people actually want.
 
 Its sibling [tiger-speech](https://github.com/tgeczy/tiger-speech) does the
-same job for 10.4 and works: all twenty-three Tiger voices, natively, about
-twelve milliseconds an utterance. The loader there is the starting point here,
-and most of it transfers unchanged.
+same job for 10.4: all twenty-three Tiger voices, natively, about twelve
+milliseconds an utterance. The loader there is the starting point here, and
+most of it transfers unchanged.
+
+## How the two repositories fit together
+
+**There is one loader, and it lives in tiger-speech.** `build.sh` here builds
+that sibling checkout and copies the result in as `leopard_host.exe`, so the
+two add-ons ship the same binary under different names.
+
+That is deliberate, and it paid for itself twice in a single day. The defect
+that made Alex crackle was in a decoder path **only Leopard's engine takes** —
+Tiger's engine goes through a different API entirely — and fixing it left
+Tiger's renders byte-for-byte identical. One loader, per-engine paths inside
+it. Forked, that fix would have had to be found twice.
+
+| | lives in |
+|---|---|
+| the loader, the shims, the host | **tiger-speech**, `src/` |
+| the Mach-O dissection tools | **tiger-speech**, `tools/` |
+| Tiger's driver, voice list, extractor | tiger-speech |
+| Leopard's driver, voice list, and this document | here |
+
+Clone them as siblings, because `build.sh` looks next door for the loader:
+
+```
+C:\git\tiger-speech
+C:\git\leopard-speech
+```
+
+The dissection tools take a symbol name or an address and work on either
+engine, which is how nearly everything below was established:
+
+```
+py -3 ..\tiger-speech\tools\machosyms.py <binary>
+py -3 ..\tiger-speech\tools\machodis.py <binary> <symbol-or-0xADDR> [length]
+py -3 ..\tiger-speech\tools\render_once.py "text" Alex 180 out.wav
+```
+
+`render_once.py` renders exactly one utterance in a fresh host. That matters
+more than it sounds: with a resident host every render after the first is
+measured in a warmed process, and giving each one its own process is what
+turned "sometimes it sounds wrong" into two exact frame counts alternating run
+to run — which is a thing you can chase.
 
 ## Why Leopard at all, when Tiger works
 
@@ -97,11 +137,12 @@ Two smaller traps came with it:
 - **A spilled PIC base looks exactly like a return address**, which is already
   written down in the loader's notes and caught nobody by surprise this time.
 
-## Where it is now: Alex speaks
+## Where it is now: Alex speaks, cleanly
 
-Confirmed by ear on 2026-08-18. He counts to seven, and he is unmistakably
-Alex. What remains is a crackle laid over the speech and a doubled initial
-consonant here and there — "thtree" for "three".
+Confirmed by ear on 2026-08-18, first that he spoke at all and then — after
+the two bugs below — that he was clean. Numbers are spoken as numbers, a
+telephone number is read digit by digit the way Apple intended, and the
+phrasing dictionary is live.
 
 Getting there needed four things, and three of them were the loader's fault
 rather than the engine's.
@@ -122,12 +163,13 @@ is exactly the value at `+0x28` of the `meow` header, then `pread`s each
 waveform grain out of the remaining 624 MB. That is Apple loading it
 chunk-by-chunk, visible in the log.
 
-**So two things written for Vicki are wrong for him.** `aac_flush_delay`
+**So something written for Vicki is wrong for him.** `aac_flush_delay`
 re-feeds the last packet to shake loose the frame Windows 7's decoder holds
 back; on one long stream the duplicates land past the end, but on Alex the
-packet *is* the payload and it arrived three times over. And the priming must
-not be trimmed — Apple sets `kAudioConverterPrimeMethod` to None, so taking
-Vicki's 2112 samples off a 1024-sample refill deletes it outright.
+packet *is* the payload and it arrived three times over.
+
+The priming needed the opposite correction, and getting that backwards is what
+made him crackle for a day — see below.
 
 **And the decoder has to stay open.** `aac_begin()` sends `COMMAND_FLUSH`, and
 AAC frames overlap: a frame is not finished until the next one's window is
@@ -136,26 +178,77 @@ boundary, which is audibly a stutter — one gap per frame. One packet in also
 yields nothing out, so a refill has to keep pulling until the decoder gives
 something back.
 
-### What the remaining crackle is not
+### The crackle, and what it actually was
 
-Measured, so that the next attempt does not start from the same four guesses:
+For a day Alex was perfectly intelligible — Whisper transcribed him without a
+mistake — and sounded like a skipping CD. It was **two** defects, neither of
+them anywhere near the codec, and the elimination list is kept here because
+every item on it cost hours:
 
-- **Not a framing seam.** The largest sample-to-sample jumps are not periodic
-  at 229 (our slice size), 256, 512, 1024 (an AAC frame) or 2048 — no offset
-  holds more than 6% of them.
-- **Not clipping.** Peak 13638 of 32767.
-- **Not the output format.** The engine asks for `'lpcm'` flags 0x0c — signed,
-  packed, little-endian, 16-bit — which is exactly what the decoder produces.
-- **Not a `pread` race.** Made atomic anyway; the render is byte-identical.
-- **Not nondeterminism.** Two runs byte-identical.
+Not a framing seam (the largest sample-to-sample jumps are not periodic at 229,
+256, 512, 1024 or 2048). Not clipping (peak 13638 of 32767). Not the output
+format. Not a `pread` race, made atomic anyway. Not nondeterministic. **Not
+WSOLA, and not any vDSP shim** — Vicki makes zero vDSP calls and was broken in
+exactly the same way. Not the engine's clock. Not `AudioUnitGetProperty`, which
+Leopard's engine imports and never calls.
 
-It looks like broadband noise laid over the speech: around each large jump the
-samples alternate sign at high amplitude, and Alex measures three times rougher
-than Fred through the same output path. The next two suspects are the WSOLA
-semantics — the argument *shapes* are confirmed from the binary, the *meanings*
-only inferred — and the engine's own scheduling clock, since
-`MTBEAudioUnitSoundOutput::QueueSamples` turns timestamps into sample positions
-and the host completes slices faster than real time.
+**One: the timeline restarts.** The engine schedules an utterance in *epochs*,
+and every epoch starts its sample clock again at zero. We placed each slice at
+its absolute sample time, so the second epoch was written straight over the
+first and whole words disappeared. It only happened about half the time — the
+same sentence came back either as one continuous timeline of 98900 frames or as
+two epochs of 48505 and 50395, run to run, and only the long one had all the
+words in it. That is why it read as memory corruption rather than as a bug with
+a shape.
+
+**Two: the AAC priming was never dropped.** There are two decoder drivers over
+one decode core. Tiger's engine drives `SoundConverter`, which decodes a
+self-contained unit at a time and takes 2112 samples of codec delay off each
+one; that path has been byte-perfect for months. Leopard's engine drives
+`AudioConverter`, which streams, and that path trimmed nothing — so every unit
+reached the engine 96 ms late, twenty-three of them in one Vicki utterance.
+Words survive that individually, which is exactly why it stayed intelligible
+and merely sounded like it was skipping.
+
+The comment justifying the missing trim said Apple sets
+`kAudioConverterPrimeMethod` to None, so there is no priming to drop. That
+conflates two things: `'prmm'` None describes what *Apple's* decoder does, while
+Media Foundation's emits the delay regardless — and the engine sizes its output
+buffer at `frameCount * 1024 - 2112`, which is Apple's priming written into the
+arithmetic. The other half of that comment was right, and is why the fix has a
+shape rather than being a revert: 2112 cannot come off a 1024-sample refill
+without deleting it. The trim belongs to the **stream**, carried across refills
+until spent.
+
+**What found it** was neither reading nor reasoning. It was a listener saying
+"vicki-leopard-engine.wav is very garbled" — which killed the theory that this
+was Alex or his container — and then "Bruce speaks 'one, two, three. ch api
+version 4'", which proved whole *words* were missing. Bruce is a formant voice,
+so AAC, the sample bank and Accelerate were all irrelevant at a stroke.
+
+### Numbers, phrasing, and the dictionary
+
+Leopard's `SpeechDictionary` needs two things Tiger's does not.
+
+**POSIX regex.** It compiles exactly one pattern at channel open —
+`^[[:digit:]]{7,}$`, a telephone number, to be read digit by digit rather than
+as a quantity. **`regexec` returns 0 for a match**, so a stub returning zero
+told the dictionary that every word was a phone number, and every number in
+every utterance was spelt out: "one, two, three" where Tiger says "one hundred
+twenty three". What is implemented reads only the shape this framework actually
+contains and refuses anything else out loud.
+
+**SQLite.** `Resources/Tuples` is a real SQLite 3 database, 628736 bytes, one
+table of 12891 multi-word keys — the phrasing table. No copy of SQLite is
+carried: Windows has shipped `winsqlite3.dll` since 10 1803 and there is a
+32-bit build in SysWOW64, which is this process's bitness because Apple's engine
+is i386. The trap is that Microsoft's build declares `SQLITE_APICALL` as
+`__stdcall` where upstream SQLite is cdecl, so the first version of that shim
+was worse than none at all.
+
+Both are instances of one lesson: **a stub returning 0 is not neutral.** For
+`sqlite3_step`, `regexec` and `AudioUnitGetProperty` alike, zero means *success*
+or *match*, so an unimplemented function confidently asserts something false.
 
 ## The stack alignment nobody can skip
 
@@ -181,19 +274,55 @@ declining to vectorise one function.
 
 Leopard's binaries import a great deal more than Tiger's, but the *linked*
 surface badly overstates the *executed* one — Tiger's engine linked 44
-undefined symbols and called six. Still outstanding if the engine reaches them:
-a CoreFoundation collection subset, **sqlite3** (eight calls, and SQLite is
-public domain so compiling it in is easy), vDSP and `sgesvd_` from Accelerate,
-AudioFile, Mach messaging, and thirteen **libstdc++** symbols. Those last must
-come from Leopard's own `/usr/lib/libstdc++.6.dylib` rather than be
-reimplemented — GCC 4.0.1's copy-on-write `basic_string` layout has to match
-exactly, and the engine inlines code that touches it.
+undefined symbols and called six. So the host reports which stubs were actually
+**reached** at exit, and that list is the one worth working from.
+
+Since done: sqlite3, POSIX regex, the Accelerate routines, and
+`AudioUnitGetProperty` — which turned out never to be called, and is
+implemented anyway because "succeeds and returns garbage" is the failure mode
+that cost the most time here.
+
+Still outstanding if the engine ever reaches them: a CoreFoundation collection
+subset, `sgesvd_` from Accelerate, AudioFile, and Mach messaging.
+
+**libstdc++ is not shimmed and must not be.** Leopard's engine links against
+`/usr/lib/libstdc++.6.dylib` and the loader maps Apple's own copy as a third
+image, because GCC 4.0.1's copy-on-write `basic_string` layout has to match
+exactly and the engine inlines code that touches it.
+
+## What the NVDA driver does with a speech sequence
+
+Worth stating, because three separate user reports in one morning all came back
+to the same misunderstanding: **adjacent strings in a speech sequence are not
+separate utterances.** NVDA inserts an `IndexCommand` only where a callback sits
+or an utterance genuinely ends, so a line of a web page with a link in it
+arrives as several plain strings with nothing between them. Rendering each one
+alone gives every fragment the falling intonation of a finished sentence, which
+is heard as the synthesizer pausing before every link. They are joined here up
+to the next index, which costs nothing in index accuracy and leaves say-all
+alone.
+
+Also honoured: `BreakCommand`, and `PitchCommand` — which is how NVDA expresses
+"capital pitch change percentage", and dropping it made that setting inert at
+any value. Volume is the engine's own `[[volm]]` command rather than gain
+applied to the samples afterwards: measured, it is exactly linear on both
+engines, so the synthesizer does the arithmetic before it quantises.
+
+Text reaches the engine as **MacRoman, not UTF-8**. Its front end reads a
+single-byte Mac encoding, and sent as UTF-8 an em dash arrived as three bytes
+and was read a character at a time — a tester heard Alex say "AI" wherever a
+story used one. MacRoman already has the em dash, the curly quotes and the
+ellipsis, so encoding properly is the whole fix.
 
 ## Getting the engine
 
 The same rule as tiger-speech, and it is not a formality: **no part of Apple's
 software will ever be distributed here.** You supply your own Leopard install
-and a tool extracts the engine from it.
+and take the engine out of it yourself.
+
+**There is no automated extractor here yet** — tiger-speech has one,
+`tools/extract_tiger.py`, and the equivalent for Leopard is not written. What
+follows is the layout it will use, and what to copy by hand meanwhile.
 
 The install DVD hides its filesystem behind a small ISO9660 boot partition, so
 a plain listing shows only the Boot Camp documentation. The real one is an APM
@@ -206,8 +335,33 @@ partition map:
   Mac_OS_X.hfs                  7,634,907,136   <- everything is in here
 ```
 
+Inside that HFS volume, the engine and Fred are live on the DVD under
+`System/Library/Speech/`; the remaining voices are inside `Essentials.pkg` and
+the 707 MB `AdditionalSpeechVoices.pkg`, and `libstdc++.6.0.4.dylib` is at
+`usr/lib`. Note the packages are **cpio, not tar**, which is the trap that
+caught the Tiger extractor first.
+
+Arrange what you take out like this, in `%APPDATA%\nvda\leopard-data`:
+
+```
+leopard-data\
+  Speech\
+    Synthesizers\MacinTalk.SpeechSynthesizer\Contents\MacOS\MacinTalk
+    Voices\<Name>.SpeechVoice\...
+  SpeechDictionary.framework\Versions\A\
+  libstdc++.6.0.4.dylib
+  libstdc++.6.dylib
+```
+
+The add-on offers to open that folder for you if it cannot find one, and says
+exactly which piece is missing rather than simply not appearing in the
+synthesizer list. `Speech\Voices` is what it probes for, and the voice list is
+built from whatever is actually there — so you can start with Fred alone, about
+33 MB, and add Alex's 670 MB once it works.
+
 ## Licence
 
-MIT, once there is anything here to license — as with tiger-speech and
-outspoken-nvda. It covers the loader and the shims: the work of making Apple's
-engine run somewhere it was never built to run, not the engine itself.
+MIT, as with tiger-speech and outspoken-nvda. It covers the driver, the loader
+and the shims — the work of making Apple's engine run somewhere it was never
+built to run — and **not the engine itself**, which is Apple's and is never
+distributed here.
