@@ -416,6 +416,22 @@ class SynthDriver(SynthDriver):
         #: timing; the rest block because the buffer is full, which is the
         #: point of feeding from its own thread.
         self._playerIdle = True
+        #: How `cancel()` reaches the engine.
+        #:
+        #: Stopping the sound is instant, but the host went on synthesising
+        #: the rest of an utterance nobody would hear, and the worker could
+        #: not begin the next one until that response ended.  Measured here:
+        #: interrupting a paragraph of Alex cost 2255 ms before the next
+        #: utterance was heard.  Streaming never touched it, because it
+        #: happens before the next utterance's first chunk can exist.
+        #:
+        #: An event rather than anything on the pipe, because rule 5 stands:
+        #: `cancel()` runs on NVDA's main thread and must never block, and
+        #: `SetEvent` cannot.  If the event cannot be made, the driver waits
+        #: exactly as it used to.
+        self._cancelEvent = None
+        self._cancelEventName = None
+        self._makeCancelEvent()
         self._queue = queue.Queue()
         self._audioQueue = queue.Queue()
         self._player = self._makePlayer()
@@ -490,12 +506,54 @@ class SynthDriver(SynthDriver):
                     env.pop("TIGER_HOST_VERBOSE", None)
             except Exception:
                 env.pop("TIGER_HOST_VERBOSE", None)
+            if self._cancelEvent:
+                env["TIGER_CANCEL_EVENT"] = self._cancelEventName
             self._proc = subprocess.Popen(
                 [HOST_EXE, "--serve", self._mt, self._sd, self._voicesdir],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, startupinfo=si, env=env)
             self._watchStderr(self._proc)
             return self._proc
+
+    def _makeCancelEvent(self):
+        """A Windows event the host can watch, named so the child can open it.
+
+        Best effort throughout: every failure here costs responsiveness after
+        an interruption and nothing else, so none of it is worth raising over.
+        """
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            name = "Local\\leopardspeech-cancel-%d-%d" % (os.getpid(), id(self))
+            # Manual reset off, initial state off: the host consumes the signal
+            # by waiting on it, and the worker clears any stale one before it
+            # sends the next request.
+            h = k32.CreateEventW(None, False, False, name)
+            if h:
+                self._cancelEvent = h
+                self._cancelEventName = name
+        except Exception as e:
+            log.debugWarning("leopardspeech: no cancel event (%s)" % e)
+
+    def _signalCancel(self):
+        """Tell the host to give up on what it is rendering.  Never blocks."""
+        if not self._cancelEvent:
+            return
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetEvent(self._cancelEvent)
+        except Exception:
+            pass
+
+    def _clearCancel(self):
+        """Drop a stale signal, so a cancel cannot kill the utterance after."""
+        if not self._cancelEvent:
+            return
+        try:
+            import ctypes
+            ctypes.windll.kernel32.ResetEvent(self._cancelEvent)
+        except Exception:
+            pass
 
     def _watchStderr(self, proc):
         """Put whatever the host complains about into NVDA's log.
@@ -603,6 +661,9 @@ class SynthDriver(SynthDriver):
             proc = self._host()
             v = voice.encode("utf-8")
             t = _encode(text)
+            # A cancel that arrived while nothing was rendering must not be
+            # waiting here to kill the utterance that follows it.
+            self._clearCancel()
             streaming = sink is not None and self._streaming
             req = REQ_MAGIC_STREAM if streaming else REQ_MAGIC
             proc.stdin.write(struct.pack("<IiiIII", req, wpm, pitch,
@@ -918,6 +979,10 @@ class SynthDriver(SynthDriver):
         left interruption silently broken while sound was still playing.
         """
         self._epoch += 1
+        # Reach the engine before draining anything: whatever it is rendering
+        # now is audio for an utterance already abandoned, and the next one
+        # cannot start until that response ends.
+        self._signalCancel()
         for q in (self._queue, self._audioQueue):
             while True:
                 try:
