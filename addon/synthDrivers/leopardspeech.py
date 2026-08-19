@@ -473,6 +473,19 @@ class SynthDriver(SynthDriver):
         #: streaming off and says why; the old request works against every host
         #: that has ever existed.
         self._streaming = True
+        #: Whether a request is on the pipe with its response still to
+        #: come.
+        #:
+        #: `cancel()` reads it to decide whether there is anything to
+        #: take the host away from.  It runs before every spoken
+        #: character, and most of those find the engine idle -- retiring
+        #: a host that was about to be reused would put its 40 ms
+        #: start-up in front of each keystroke, which is the fault this
+        #: was written to remove, not one to add.
+        self._rendering = False
+        #: Whether a retirement is already under way, so that a burst of
+        #: cancels starts one thread rather than one per keystroke.
+        self._retiring = False
         #: Whether the output stream has been stopped or has run dry, so that
         #: the next chunk fed has to start it again.  Only that one is worth
         #: timing; the rest block because the buffer is full, which is the
@@ -582,6 +595,12 @@ class SynthDriver(SynthDriver):
             self._restartWanted = False
             if self._proc is not None and self._proc.poll() is None:
                 return self._proc
+            if self._stopped:
+                # `terminate()` raises this flag and then takes this same
+                # lock to kill the host.  Without the check, a retirement
+                # already in flight could start a replacement after that
+                # and leave a host running with nothing to serve.
+                raise RuntimeError("leopard-speech is shutting down")
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             # Follow NVDA's own log level. Someone who has turned debug
@@ -620,6 +639,75 @@ class SynthDriver(SynthDriver):
                 stderr=subprocess.PIPE, startupinfo=si, env=env)
             self._watchStderr(self._proc)
             return self._proc
+
+    def _abandonHost(self):
+        """Take the host away from an utterance nobody is going to hear.
+
+        **Signalling the cancel is not enough, and measuring is what said so.**
+        The host honours it by throwing its audio away, but it goes on
+        synthesising to the end of the utterance, so the response takes just as
+        long as if nothing had been cancelled: a paragraph of Alex measured
+        815 ms rendered, and 832 ms rendered then cancelled after 50 ms.  The
+        worker cannot start the next utterance until it has read that response
+        out of the pipe -- and it is not even reading, because once the cancel
+        is honoured no further chunks arrive.  It is asleep in a read that has
+        nothing left to deliver.
+
+        That wait is the lag people report around a long post.  Two logs of it:
+        arrowing past a paragraph, press down and hear nothing for the better
+        part of a second; and a 6429-character post, where twelve keypresses
+        over five and a half seconds produced no speech at all until the render
+        ended after 7455 ms.  It looks exactly like the synthesizer has died,
+        and alt-tabbing appears to fix it only because the wait ends on its own.
+
+        Killing the process ends that read in 1.3 ms, measured, and a
+        replacement is ready to speak about 40 ms later.
+
+        Off this thread, always.  `cancel()` runs on NVDA's main thread, and
+        while killing a process is not the pipe -- rule 5 stands -- it does
+        take the process lock, and the replacement it starts costs those 40 ms.
+        Neither belongs in front of a keystroke.
+        """
+        if self._stopped or self._retiring or not self._rendering:
+            return
+        self._retiring = True
+        try:
+            threading.Thread(target=self._retire, name="leopardspeech-retire",
+                             daemon=True).start()
+        except Exception:
+            self._retiring = False
+
+    def _retire(self):
+        """Kill the host, then have its replacement warm before it is wanted.
+
+        The prewarm is why this is a thread rather than two lines in
+        `cancel()`: start-up is about 40 ms, and running it here overlaps it
+        with whatever the driver does between one utterance and the next,
+        instead of charging it to the utterance itself.
+        """
+        try:
+            with self._procLock:
+                proc, self._proc = self._proc, None
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                # The pipes are left to the worker and the garbage collector.
+                # Closing them here would be closing handles another thread is
+                # blocked reading, and the kill has already given that read its
+                # end of file.
+            if not self._stopped:
+                try:
+                    self._host()
+                except Exception:
+                    pass
+        finally:
+            self._retiring = False
 
     def _makeCancelEvent(self):
         """A Windows event the host can watch, named so the child can open it.
@@ -784,6 +872,15 @@ class SynthDriver(SynthDriver):
         elif self._volumeSent:
             text = "[[volm 1.000]]%s" % text
             self._volumeSent = False
+        #: Ours, and only ours.  A cancel can retire this process and
+        #: start its replacement while this call is still in the read
+        #: below, and the failure that follows must not kill the host the
+        #: next utterance is about to use.
+        proc = None
+        #: Whether the host answered at all.  It is what separates a host
+        #: that cannot stream from one that was taken away mid-stream, and
+        #: only the first of those is a reason to stop asking.
+        answered = False
         try:
             proc = self._host()
             v = voice.encode("utf-8")
@@ -793,6 +890,9 @@ class SynthDriver(SynthDriver):
             self._clearCancel()
             streaming = sink is not None and self._streaming
             req = REQ_MAGIC_STREAM if streaming else REQ_MAGIC
+            # From here until the response ends, this is what cancel() may
+            # take the host away from.
+            self._rendering = True
             proc.stdin.write(struct.pack("<IiiIII", req, wpm, pitch,
                                          0, len(v), len(t)) + v + t)
             proc.stdin.flush()
@@ -801,6 +901,7 @@ class SynthDriver(SynthDriver):
                     "<IiI", _readExactly(proc.stdout, 12))
                 if magic != RSP_MAGIC:
                     raise IOError("bad response magic %08x" % magic)
+                answered = True
                 pcm = _readExactly(proc.stdout, nframes * 2)
                 if status:
                     log.debugWarning("leopardspeech: OSErr %d for %r"
@@ -819,6 +920,7 @@ class SynthDriver(SynthDriver):
             magic, status = struct.unpack("<Ii", _readExactly(proc.stdout, 8))
             if magic != RSP_MAGIC:
                 raise IOError("bad response magic %08x" % magic)
+            answered = True
             feeding = True
             while True:
                 (n,) = struct.unpack("<I", _readExactly(proc.stdout, 4))
@@ -843,13 +945,17 @@ class SynthDriver(SynthDriver):
             # so drop the process rather than trying to resynchronise.
             log.debugWarning("leopardspeech: %s" % e)
             with self._procLock:
-                if self._proc is not None:
+                # Only the process this call was using.  A cancel may
+                # already have retired it and started its replacement, and
+                # killing *that* would throw away the host the next
+                # utterance needs -- for ever, one utterance at a time.
+                if proc is not None and self._proc is proc:
                     try:
                         self._proc.kill()
                     except Exception:
                         pass
                     self._proc = None
-            if sink is not None and self._streaming:
+            if sink is not None and self._streaming and not answered:
                 # A host that does not know 'TGR4' exits rather than answer it,
                 # which arrives here as a closed pipe.  Left alone this repeats
                 # for every utterance -- respawn, refuse, respawn -- and the
@@ -862,6 +968,8 @@ class SynthDriver(SynthDriver):
                             "are older than this driver -- reinstall the "
                             "add-on. Speaking the previous way instead.")
             return None
+        finally:
+            self._rendering = False
 
     # -- threads -----------------------------------------------------------
     def _run(self):
@@ -992,10 +1100,29 @@ class SynthDriver(SynthDriver):
             return True
 
         pcm = self._render(text, wpm, voice, self._pitchOffset(adj), sink=sink)
-        if pcm is None and not fed and not self._streaming:
-            # That failure was the host refusing to stream, and it has just
-            # been turned off.  Say this utterance the old way rather than
-            # losing it -- it could be the one telling the user what happened.
+        if (pcm is None and not fed and not self._stopped
+                and self._epoch == epoch):
+            # Nothing was said and nothing was heard, and this utterance is
+            # still the one the user is waiting for.  Two failures arrive
+            # here.
+            #
+            # The host refused to stream, and streaming has just been
+            # turned off -- so say it the old way rather than lose it,
+            # because it could be the one telling the user what happened.
+            #
+            # Or a cancel retired the host a moment after this utterance
+            # had started on it.  That cancel was for the utterance
+            # *before* this one -- the queue was drained before this item
+            # was taken off it -- so this text is still wanted, and the
+            # retirement has left a fresh host to say it on.  Rule 3 at the
+            # top of this file is the whole reason the case is handled
+            # rather than reasoned about: an utterance dropped in silence
+            # is the failure that matters.
+            #
+            # The epoch guard is what keeps it from costing anything.  Text
+            # that really was cancelled is not rendered a second time only
+            # to be thrown away, which would put back the wait the
+            # retirement exists to remove.
             pcm = self._render(text, wpm, voice, self._pitchOffset(adj),
                                sink=sink)
         # Timing, at DEBUG, because "it lags on long text" is the report this
@@ -1009,10 +1136,12 @@ class SynthDriver(SynthDriver):
             frames = sum(fed) / 2.0
             log.debug("leopardspeech: %d chars -> %.2f s of audio in %d "
                       "chunk(s); first sound after %.0f ms, all of it by "
-                      "%.0f ms"
+                      "%.0f ms%s"
                       % (len(text), frames / OUT_RATE, len(fed),
                          (firstAt[0] - started) * 1000.0,
-                         (done - started) * 1000.0))
+                         (done - started) * 1000.0,
+                         "" if self._epoch == epoch
+                         else " (interrupted; the host was retired)"))
         if pcm is not None and fed and self._epoch == epoch:
             gap = self.PAUSE_MS.get(self._pauseMode, 0)
             if gap:
@@ -1177,6 +1306,14 @@ class SynthDriver(SynthDriver):
         # now is audio for an utterance already abandoned, and the next one
         # cannot start until that response ends.
         self._signalCancel()
+        # And take the host away from what it is rendering.  The signal
+        # alone only stops the audio; the response still takes as long as
+        # the whole utterance would have, and the worker is stuck reading
+        # it -- see _abandonHost(), which measures both.  Nothing happens
+        # unless something really is rendering, and the work itself is on
+        # its own thread, so this stays off NVDA's main thread as rule 5
+        # requires.
+        self._abandonHost()
         pendingDone = None
         for q in (self._queue, self._audioQueue):
             while True:
