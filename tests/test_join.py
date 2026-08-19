@@ -87,21 +87,21 @@ def test_it_stops_at_two_sentences(d):
     assert d._queue.qsize() == 1, "the third line must still be waiting"
 
 
-def test_the_last_sentence_of_a_document_is_still_spoken(d):
+def test_the_last_sentence_of_a_document_is_still_spoken(d, monkeypatch):
     """Nothing follows it, and NVDA never says so.
 
     A driver is not told that an utterance was the last: NVDA splits sequences
     at EndUtteranceCommand before they get here.  So the timeout is not a
     safety net, it is the only thing that speaks the final sentence.
     """
-    leopardspeech.JOIN_WAIT = 0.05          # keep the test quick
+    monkeypatch.setattr(leopardspeech, "JOIN_WAIT", 0.05)
     out = d._join([("text", S1), ("index", 1)], d._epoch)
     assert _texts(out) == [S1]
 
 
-def test_text_without_a_full_stop_is_bounded(d):
+def test_text_without_a_full_stop_is_bounded(d, monkeypatch):
     """A page with no punctuation must not accumulate until someone notices."""
-    leopardspeech.JOIN_WAIT = 0.05
+    monkeypatch.setattr(leopardspeech, "JOIN_WAIT", 0.05)
     for i in range(40):
         d._queue.put([("text", "a clause with no full stop in it at all "),
                       ("index", i)])
@@ -124,7 +124,7 @@ def test_navigation_speech_is_never_held(d):
     assert d._queue.qsize() == 1
 
 
-def test_an_announcement_carrying_an_index_is_not_held(d):
+def test_an_announcement_carrying_an_index_is_not_held(d, monkeypatch):
     """NVDA puts an index on more than say-all lines.
 
     A callback in a sequence reaches a driver as an IndexCommand too, so the
@@ -134,7 +134,7 @@ def test_an_announcement_carrying_an_index_is_not_held(d):
     heard a third of a second late.
     """
     import time
-    leopardspeech.JOIN_WAIT = 5.0
+    monkeypatch.setattr(leopardspeech, "JOIN_WAIT", 5.0)
     t = time.time()
     out = d._join([("text", "Search results list"), ("index", 7)], d._epoch)
     assert time.time() - t < 0.5
@@ -169,7 +169,7 @@ def test_cancelling_stops_the_join(d):
     assert _texts(out) == [S1]
 
 
-def test_the_first_utterance_after_a_cancel_never_waits(d):
+def test_the_first_utterance_after_a_cancel_never_waits(d, monkeypatch):
     """Starting to read must be as immediate as it was.
 
     With nothing queued yet this would otherwise sit for JOIN_WAIT before a
@@ -177,7 +177,7 @@ def test_the_first_utterance_after_a_cancel_never_waits(d):
     """
     import time
     d._spokeSinceCancel = False
-    leopardspeech.JOIN_WAIT = 5.0       # would be unmissable if it waited
+    monkeypatch.setattr(leopardspeech, "JOIN_WAIT", 5.0)
     t = time.time()
     d._join([("text", S1), ("index", 1)], d._epoch)
     assert time.time() - t < 0.5
