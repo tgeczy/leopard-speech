@@ -349,12 +349,18 @@ class SynthDriver(SynthDriver):
             _("&Natural phrasing (fewer mid-sentence pauses)"),
             defaultVal=True,
         ),
-        # Leopard's dictionary has rules for KB, 20ish, 1,234MB and Roman
-        # numerals.  Every one of them was dead until the pattern reader became
-        # a real one, so "off" is what this add-on has always sounded like.
+        # Leopard's dictionary rewrites a quantity followed by a unit and the
+        # -ish suffix.  Both were dead until the pattern reader became a real
+        # one, so "off" is what this add-on has always sounded like.
+        #
+        # The examples in the label are the forms that actually fire.  A bare
+        # "KB" does not: the rule is quantity-then-capitals, so "5KB" is
+        # rewritten and "KB" on its own is not.  The first version of this
+        # label said "KB", and Tomi read the label itself aloud to test the
+        # setting -- which changed nothing, exactly as the engine intends.
         BooleanDriverSetting(
             "expandAbbreviations",
-            _("Expand &abbreviations (KB, 20ish, Roman numerals)"),
+            _("Expand &abbreviations (5KB, 1,234MB, 20ish)"),
             defaultVal=True,
         ),
     )
