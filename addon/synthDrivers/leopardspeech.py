@@ -336,9 +336,18 @@ class SynthDriver(SynthDriver):
             defaultVal=False,
             availableInSettingsRing=True,
         ),
+        # Two settings here put silence into speech and they are not the same
+        # thing, so they must not read alike.  This one is *ours*: NVDA hands
+        # an announcement over in pieces -- a control's name, then its role,
+        # then its state -- and this is the gap the driver puts between those
+        # pieces.  It does nothing inside a sentence.
+        #
+        # It was called "Pause between phrases" and sat next to "Phrase
+        # pauses", both on Alt+P.  Tomi: "people will confuse those two.  They
+        # will ask me how they differ, and I will have to explain each time."
         DriverSetting(
             "pauseMode",
-            _("&Pause between phrases"),
+            _("&Gap between announcement parts"),
             defaultVal="short",
         ),
         # How readily the engine breaks a phrase.  It asks how strong a
@@ -365,7 +374,9 @@ class SynthDriver(SynthDriver):
         # of them on the first, which is the complaint this began with.
         DriverSetting(
             "phrasing",
-            _("Phrase &pauses"),
+            # The engine's own decision, inside a sentence, about where a
+            # clause ends -- nothing to do with the gap setting above.
+            _("Engine phrase &breaks"),
             defaultVal="fewest",
             availableInSettingsRing=True,
         ),
