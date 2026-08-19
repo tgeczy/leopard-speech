@@ -86,7 +86,36 @@ OUT_RATE = 22050
 #:
 #: Small enough that an interrupt cannot leave much behind, large
 #: enough that playback never catches up with the renderer.
-FEED_LEAD = 0.35
+#:
+#: **It also has to stay under the output device's own buffer**, which is
+#: what makes `feed()` block, and blocking there is what a cancel collides
+#: with -- see FEED_SLICE.  Measured from two uninterrupted feeds in a user's
+#: log: 939 ms of audio blocked 614 ms, and 457 ms blocked 203 ms, so the
+#: device holds 250 to 330 ms.  This plus one slice has to be less than that.
+FEED_LEAD = 0.15
+
+#: The largest piece of audio handed to the player in one call, in seconds.
+#:
+#: **The host answers a streamed request with the whole utterance in one
+#: chunk.**  Every log line says "in 1 chunk(s)", for 40 characters and for
+#: 740 alike, because the engine calls back once per `SESpeakBuffer`.  So the
+#: pacing above never engaged -- one `feed()` carried seventeen seconds of
+#: audio -- and that one call blocked, holding `_playerLock`, for as long as
+#: it took the device to drain: measured 643, 343, 294, 361 and 556 ms.
+#:
+#: In every one of those five, the call returned within 36 ms of the keypress
+#: that cancelled it.  That is not a coincidence and it is not the device
+#: being slow: `cancel()` was landing *inside* the feed, every single time.
+#: It waits 20 ms for the lock the feeder is holding, gives up, and calls
+#: `stop()` anyway -- which is exactly the unsynchronised stop-during-feed
+#: this driver already knew stalls the next start, measured at 1839 ms.
+#:
+#: Slicing the audio here is what puts the pacing back in charge.  A slice
+#: fits the device buffer, so `feed()` returns at once, so the lock is free
+#: when `cancel()` asks for it, so the stop lands between feeds where it is
+#: safe.  It also bounds what an interrupt leaves in the device to one
+#: FEED_LEAD rather than a whole utterance.
+FEED_SLICE = 0.08
 
 #: NVDA's 0-100 rate onto words per minute.  180 is the engine's own default and
 #: lands mid-slider, so the control behaves the way people expect.
@@ -195,6 +224,177 @@ def _fullVolumeByDefault(setting):
     """
     setting.defaultVal = 100
     return setting
+
+
+#: Text shorter than this is never split.
+#:
+#: Low, because characters are a poor proxy for how long a thing takes to
+#: say and the error runs the wrong way.  "Saved Messages, nvda dot zip,
+#: Sent 2026-08-17 at 11:08" is 80 characters and 2.98 seconds of audio --
+#: dates, filenames and version numbers expand about fourfold -- and it cost
+#: 193 ms of silence before a word of it was heard.  Measured across a list:
+#: 27 to 36 characters per second of audio, against 40 to 60 for prose.
+#:
+#: What is under this really is short: a word, a control type, a state.
+SPLIT_MIN = 60
+
+#: How much has to accumulate before a boundary may close the *first* piece.
+#:
+#: Small, because this piece alone is what the user waits for, and because
+#: character count is not what the wait is made of.  Measured: 275 characters
+#: of URL became 12.46 s of audio and 789 ms of silence first, while 233
+#: characters of Arabic became 2.65 s.  The engine renders at a steady 60 to
+#: 65 ms per second of audio, so the wait is set by how much *audio* has to
+#: exist before any of it may be heard -- and a short first piece is short in
+#: audio whatever the text is made of.
+SPLIT_FIRST = 12
+
+#: And for every piece after it.  Larger, because these are rendered while
+#: the piece before them is still playing, so their cost is hidden -- but not
+#: unbounded, or the piece after a short one would not be ready in time.
+SPLIT_TARGET = 160
+
+#: How far past SPLIT_TARGET a sentence end is still worth waiting for.
+#:
+#: Inside this, the split goes there and the prosody is untouched.  Past it,
+#: a phrase boundary is taken instead: a comma the engine was already going
+#: to break at loses its continuation rise and gains a full stop, which is a
+#: real change, and a smaller one than a second of silence.
+SPLIT_SLACK = 200
+
+#: Closing quotes and brackets that may sit between a sentence terminator
+#: and the space after it.  Built through re.escape rather than written as
+#: a character class, so the source carries no escape for Python to read
+#: differently from the regex engine.
+_CLOSERS = ")]}\"”’'»"
+_SENTENCE_END = re.compile("[.!?][" + re.escape(_CLOSERS) + "]*\\s+")
+
+#: Words that end in a full stop without ending a sentence.
+_ABBREVIATIONS = frozenset("""
+mr mrs ms dr prof rev hon sr jr st mt gen col sgt lt capt
+ave rd blvd dept est fig vol no nos pp al vs etc approx
+inc ltd co corp univ dept
+jan feb mar apr jun jul aug sep sept oct nov dec
+mon tue tues wed thu thur thurs fri sat sun
+am pm
+""".split())
+
+
+def _sentenceStarts(text):
+    """-> offsets in `text` where a new sentence demonstrably begins.
+
+    **Conservative on purpose.**  A boundary that is not really one is heard
+    as a full stop in the middle of a sentence, which is exactly the fault
+    this driver joins NVDA's fragments together to avoid -- "narrowing.
+    budgets", at the wrapped line boundaries.  Everything doubtful is left
+    alone here, which costs latency on that utterance and never costs a wrong
+    reading.
+    """
+    for m in _SENTENCE_END.finditer(text):
+        start = m.end()
+        if start >= len(text):
+            break
+        if text[m.start()] == ".":
+            word = re.search(r"[\w']+$", text[:m.start()])
+            if word:
+                w = word.group(0)
+                # A single letter before a full stop is an initial or part of
+                # an abbreviation, never the end of a sentence: "J. Smith",
+                # "U.S. Army", "e.g. this one".
+                if len(w) == 1 or w.lower() in _ABBREVIATIONS:
+                    continue
+        nxt = text[start]
+        # What follows has to be able to open a sentence.  A lower case
+        # letter after a full stop is an abbreviation this list does not
+        # know about -- "in Leopard's. the engine names", from a real post.
+        # `islower` rather than `isupper` so that Arabic, Hebrew and CJK,
+        # which are neither, are not excluded from splitting.
+        if nxt.islower() or not (nxt.isalnum() or nxt in "\"'“‘(["):
+            continue
+        yield start
+
+
+#: Punctuation the engine already breaks a phrase at.  Weaker than a
+#: sentence end and used only when no sentence end is near -- see
+#: SPLIT_SLACK.  A number never matches: "1,000" and "18:05" have no space
+#: after the mark, and the space is required.
+_PHRASE_MARKS = ",;:—–"
+_PHRASE_END = re.compile("[.!?" + re.escape(_PHRASE_MARKS) + "][ "
+                         + re.escape(_CLOSERS) + "]*\\s+")
+
+
+def _phraseStarts(text):
+    """-> offsets where a new phrase begins: sentence ends and the marks above.
+
+    The sentence rules still apply to a full stop, so an abbreviation is no
+    more a phrase boundary here than it was a sentence one.
+    """
+    sentences = set(_sentenceStarts(text))
+    for m in _PHRASE_END.finditer(text):
+        start = m.end()
+        if start >= len(text):
+            break
+        if text[m.start()] in ".!?":
+            if start in sentences:
+                yield start
+            continue
+        yield start
+
+
+def _splitUtterance(text):
+    """-> `text` in pieces that rejoin to exactly `text`.
+
+    The first piece is cut as early as a boundary allows, because it is the
+    only one the user waits for.  Every piece after it is rendered while the
+    one before it plays, so those are cut long, and only at a sentence end
+    unless none is anywhere near.
+
+    Never fewer characters than went in, and never a cut anywhere except a
+    boundary the text already had, so an utterance with none comes back whole
+    and is rendered exactly as it was before.
+    """
+    if len(text) <= SPLIT_MIN:
+        return [text]
+    sentences = list(_sentenceStarts(text))
+    phrases = list(_phraseStarts(text))
+
+    def firstPast(offsets, lower, upper=None):
+        for off in offsets:
+            if off >= lower and (upper is None or off <= upper):
+                return off
+        return None
+
+    pieces = []
+    at = 0
+    want = SPLIT_FIRST
+    while True:
+        # A sentence end if there is one within reach, a phrase boundary only
+        # if there is not.
+        cut = firstPast(sentences, at + want, at + want + SPLIT_SLACK)
+        if cut is None:
+            cut = firstPast(phrases, at + want)
+        if cut is None or cut <= at:
+            break
+        pieces.append(text[at:cut])
+        at = cut
+        want = SPLIT_TARGET
+    pieces.append(text[at:])
+    return [piece for piece in pieces if piece.strip()]
+
+
+def _sliceAudio(pcm, seconds):
+    """Cut PCM into pieces of at most `seconds`, on frame boundaries.
+
+    Never zero-length and never an odd number of bytes: half a frame handed
+    to the player is a click, and a frame split across two feeds is a click
+    in the middle of a word.
+    """
+    step = max(2, int(OUT_RATE * seconds) * 2)
+    if len(pcm) <= step:
+        yield pcm
+        return
+    for i in range(0, len(pcm), step):
+        yield pcm[i:i + step]
 
 
 def _silence(ms):
@@ -313,6 +513,18 @@ def _explainLater(folder):
             log.error("leopard-speech: could not show the engine dialog",
                       exc_info=True)
     wx.CallAfter(show)
+
+
+#: What the host says on every single startup.  Not complaints, and the only
+#: reason they were ever loud is that everything the host prefixes with its
+#: own name was treated as one.  A real complaint -- a voice that will not
+#: decode, a tree it cannot read -- is not in this list and stays at warning.
+_HOST_ROUTINE = (
+    "ready,",
+    "verbose logging on",
+    "reading engine parameters",
+    "parameter ",
+)
 
 
 class SynthDriver(SynthDriver):
@@ -783,10 +995,18 @@ class SynthDriver(SynthDriver):
                     # read with its own name.  Everything else is commentary
                     # and belongs at debug level, or a user's log fills with
                     # several hundred lines of loader detail.
-                    if line.startswith("tiger_host:"):
-                        log.warning("leopard-speech host: %s" % line)
-                    else:
+                    if not line.startswith("tiger_host:"):
                         log.debug("leopard-speech host: %s" % line)
+                    elif line[11:].lstrip().startswith(_HOST_ROUTINE):
+                        # Said once per host, and the host is started again
+                        # after every interruption, so at warning level this
+                        # is three or four lines per arrow key.  One real log
+                        # was nothing else: forty startups in ninety seconds,
+                        # burying the one line that mattered.  It is still
+                        # here at debug, where the rest of the startup is.
+                        log.debug("leopard-speech host: %s" % line)
+                    else:
+                        log.warning("leopard-speech host: %s" % line)
             except Exception:
                 pass
             finally:
@@ -957,6 +1177,11 @@ class SynthDriver(SynthDriver):
             # The protocol is a stream: a failed exchange leaves it out of step,
             # so drop the process rather than trying to resynchronise.
             log.debugWarning("leopardspeech: %s" % e)
+            #: Whether somebody else took this process away, rather than it
+            #: dying on us.  `_retire`, `_host` and `terminate` all swap
+            #: `self._proc` under this lock *before* they kill or close, so a
+            #: process that is no longer the current one was retired.
+            retired = False
             with self._procLock:
                 # Only the process this call was using.  A cancel may
                 # already have retired it and started its replacement, and
@@ -968,13 +1193,34 @@ class SynthDriver(SynthDriver):
                     except Exception:
                         pass
                     self._proc = None
-            if sink is not None and self._streaming and not answered:
+                elif proc is not None:
+                    retired = True
+            if (sink is not None and self._streaming and not answered
+                    and not retired):
                 # A host that does not know 'TGR4' exits rather than answer it,
                 # which arrives here as a closed pipe.  Left alone this repeats
                 # for every utterance -- respawn, refuse, respawn -- and the
                 # user hears nothing at all, ever.  This actually happened
                 # here, with an executable one build out of date.  So stop
                 # asking, and say so where somebody will see it.
+                #
+                # **But a cancel closes the pipe in exactly the same way.**
+                # `_abandonHost` kills the host mid-request precisely so the
+                # worker is not left reading a response nobody wants, and
+                # `answered` cannot tell that apart from a refusal: both are
+                # a request written and no magic read back.  So a burst of
+                # interruptions turned streaming off for the session and told
+                # the user to reinstall a perfectly good add-on -- seen here
+                # in a real log, after which every utterance went back to
+                # arriving in one piece.
+                #
+                # `retired` is what separates them.  A host that refuses is
+                # still the current one when its pipe closes; a host taken
+                # away was swapped out under `_procLock` first.  Note that
+                # "has it ever streamed?" does *not* work here: an add-on
+                # updated under a running NVDA really can start refusing
+                # after a session of success, which is what
+                # test_an_engine_that_cannot_stream_still_speaks asserts.
                 self._streaming = False
                 log.warning("leopardspeech: the bundled engine does not "
                             "understand streamed audio, which means its files "
@@ -1112,32 +1358,55 @@ class SynthDriver(SynthDriver):
             self._audioQueue.put(("audio", chunk, epoch))
             return True
 
-        pcm = self._render(text, wpm, voice, self._pitchOffset(adj), sink=sink)
-        if (pcm is None and not fed and not self._stopped
-                and self._epoch == epoch):
-            # Nothing was said and nothing was heard, and this utterance is
-            # still the one the user is waiting for.  Two failures arrive
-            # here.
-            #
-            # The host refused to stream, and streaming has just been
-            # turned off -- so say it the old way rather than lose it,
-            # because it could be the one telling the user what happened.
-            #
-            # Or a cancel retired the host a moment after this utterance
-            # had started on it.  That cancel was for the utterance
-            # *before* this one -- the queue was drained before this item
-            # was taken off it -- so this text is still wanted, and the
-            # retirement has left a fresh host to say it on.  Rule 3 at the
-            # top of this file is the whole reason the case is handled
-            # rather than reasoned about: an utterance dropped in silence
-            # is the failure that matters.
-            #
-            # The epoch guard is what keeps it from costing anything.  Text
-            # that really was cancelled is not rendered a second time only
-            # to be thrown away, which would put back the wait the
-            # retirement exists to remove.
-            pcm = self._render(text, wpm, voice, self._pitchOffset(adj),
+        # Long text goes to the engine a sentence at a time.
+        #
+        # The engine renders at a steady 14 to 19 times real time, so the
+        # wait before the first sound is set by how much audio has to
+        # exist before any of it may be heard -- the whole utterance,
+        # because the host answers in one chunk.  Measured on one 792
+        # character post, three times: 1323, 1383 and 1369 ms.
+        #
+        # Rendering the first sentence alone costs a fraction of that, and
+        # the rest is rendered while it plays.  **Only at sentence ends**,
+        # and only for text long enough to be worth it -- see
+        # _sentenceStarts, which refuses every boundary it cannot prove.
+        # Splitting anywhere else is what this driver joins NVDA's
+        # fragments together to avoid.
+        pieces = _splitUtterance(text)
+        pcm = None
+        for piece in pieces:
+            if self._stopped or self._epoch != epoch:
+                break
+            # Per piece, not per utterance: a failure in the middle of a
+            # long post must not cost the rest of it.
+            heard = len(fed)
+            pcm = self._render(piece, wpm, voice, self._pitchOffset(adj),
                                sink=sink)
+            if (pcm is None and len(fed) == heard and not self._stopped
+                    and self._epoch == epoch):
+                # Nothing was said and nothing was heard, and this utterance is
+                # still the one the user is waiting for.  Two failures arrive
+                # here.
+                #
+                # The host refused to stream, and streaming has just been
+                # turned off -- so say it the old way rather than lose it,
+                # because it could be the one telling the user what happened.
+                #
+                # Or a cancel retired the host a moment after this utterance
+                # had started on it.  That cancel was for the utterance
+                # *before* this one -- the queue was drained before this item
+                # was taken off it -- so this text is still wanted, and the
+                # retirement has left a fresh host to say it on.  Rule 3 at the
+                # top of this file is the whole reason the case is handled
+                # rather than reasoned about: an utterance dropped in silence
+                # is the failure that matters.
+                #
+                # The epoch guard is what keeps it from costing anything.  Text
+                # that really was cancelled is not rendered a second time only
+                # to be thrown away, which would put back the wait the
+                # retirement exists to remove.
+                pcm = self._render(piece, wpm, voice,
+                                   self._pitchOffset(adj), sink=sink)
         # Timing, at DEBUG, because "it lags on long text" is the report this
         # add-on gets most and it was never possible to check from a log.  Both
         # numbers, per utterance: a first sound that arrives late is a
@@ -1147,10 +1416,11 @@ class SynthDriver(SynthDriver):
         if fed and log.isEnabledFor(log.DEBUG):
             done = time.perf_counter()
             frames = sum(fed) / 2.0
-            log.debug("leopardspeech: %d chars -> %.2f s of audio in %d "
-                      "chunk(s); first sound after %.0f ms, all of it by "
-                      "%.0f ms%s"
-                      % (len(text), frames / OUT_RATE, len(fed),
+            log.debug("leopardspeech: %d chars in %d piece(s) -> %.2f s of "
+                      "audio in %d chunk(s); first sound after %.0f ms, "
+                      "all of it by %.0f ms%s"
+                      % (len(text), len(pieces), frames / OUT_RATE,
+                         len(fed),
                          (firstAt[0] - started) * 1000.0,
                          (done - started) * 1000.0,
                          "" if self._epoch == epoch
@@ -1209,43 +1479,62 @@ class SynthDriver(SynthDriver):
                     # Staying a fraction of a second ahead bounds what an
                     # interrupt can leave behind, and cannot underrun: the
                     # engine renders many times faster than real time.
-                    now = time.perf_counter()
-                    if self._fedUntil < now:
-                        self._fedUntil = now
-                    while (self._fedUntil - now > FEED_LEAD
-                           and not self._stopped
-                           and tag == self._epoch):
-                        time.sleep(0.01)
-                        now = time.perf_counter()
-                    if tag is not None and tag != self._epoch:
-                        continue        # interrupted while we waited
-                    self._fedUntil = max(self._fedUntil, now) +                         len(value) / 2.0 / OUT_RATE
-                    # Serialised against cancel()'s stop().
                     #
-                    # NVDA's WASAPI player changes its stream state in both
-                    # feed() and stop() without synchronising the two, so a
-                    # stop landing while a feed is starting the stream leaves
-                    # the next start to stall -- measured at 1839 ms in one
-                    # session, which is the "two seconds and you hear nothing"
-                    # people reported -- and can let frames from the abandoned
-                    # utterance through into the stream that follows.
-                    with self._playerLock:
-                        if self._playerIdle:
-                            self._playerIdle = False
-                            t0 = time.perf_counter()
-                            self._player.feed(value)
-                            ms = (time.perf_counter() - t0) * 1000.0
-                            if ms >= 20.0 and log.isEnabledFor(log.DEBUG):
-                                log.debug(
-                                    "leopardspeech: the audio device took %.0f ms "
-                                    "to start playing (%.0f ms of audio, "
-                                    "after %s)"
-                                    % (ms, len(value) / 2.0 / OUT_RATE * 1000.0,
-                                       "an interruption" if self._afterCancel
-                                       else "the previous utterance ended"))
-                            self._afterCancel = False
-                        else:
-                            self._player.feed(value)
+                    # A slice at a time, because the host hands over a whole
+                    # utterance in one chunk and one `feed()` of that size
+                    # blocks for seconds -- see FEED_SLICE.  The epoch is
+                    # rechecked between slices, so an interrupt stops this
+                    # utterance here rather than after the device has drained
+                    # what it was already given.
+                    for piece in _sliceAudio(value, FEED_SLICE):
+                        if self._stopped or (tag is not None
+                                             and tag != self._epoch):
+                            break
+                        now = time.perf_counter()
+                        if self._fedUntil < now:
+                            self._fedUntil = now
+                        while (self._fedUntil - now > FEED_LEAD
+                               and not self._stopped
+                               and tag == self._epoch):
+                            time.sleep(0.01)
+                            now = time.perf_counter()
+                        if tag is not None and tag != self._epoch:
+                            break       # interrupted while we waited
+                        self._fedUntil = max(self._fedUntil, now) +                             len(piece) / 2.0 / OUT_RATE
+                        # Serialised against cancel()'s stop().
+                        #
+                        # NVDA's WASAPI player changes its stream state in
+                        # both feed() and stop() without synchronising the
+                        # two, so a stop landing while a feed is starting the
+                        # stream leaves the next start to stall -- measured at
+                        # 1839 ms in one session, which is the "two seconds
+                        # and you hear nothing" people reported -- and can let
+                        # frames from the abandoned utterance through into the
+                        # stream that follows.
+                        #
+                        # `cancel()` waits only 20 ms for this lock, because
+                        # it runs on NVDA's main thread.  That is enough only
+                        # while what is held under it is short, which is the
+                        # whole reason the audio is sliced above.
+                        with self._playerLock:
+                            if self._playerIdle:
+                                self._playerIdle = False
+                                t0 = time.perf_counter()
+                                self._player.feed(piece)
+                                ms = (time.perf_counter() - t0) * 1000.0
+                                if ms >= 20.0 and log.isEnabledFor(log.DEBUG):
+                                    log.debug(
+                                        "leopardspeech: the audio device took "
+                                        "%.0f ms to start playing (%.0f ms of "
+                                        "audio, after %s)"
+                                        % (ms,
+                                           len(piece) / 2.0 / OUT_RATE * 1000.0,
+                                           "an interruption"
+                                           if self._afterCancel
+                                           else "the previous utterance ended"))
+                                self._afterCancel = False
+                            else:
+                                self._player.feed(piece)
                 elif kind == "index":
                     synthIndexReached.notify(synth=self, index=value)
                 elif kind == "done":
