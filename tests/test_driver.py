@@ -1216,3 +1216,106 @@ def test_turning_a_setting_off_restarts_the_engine(driver):
     # And it still speaks afterwards.
     assert driver._render("one two three", driver._wpm(), driver._get_voice())
     driver._set_expandAbbreviations(True)
+
+
+def test_a_very_long_utterance_can_still_be_interrupted(driver):
+    """The same lag as the test above, at the length that made it look fatal.
+
+    A paragraph costs the better part of a second.  A whole post costs seconds,
+    and at that length the driver does not read as slow -- it reads as dead.
+    From a real session, arrowing a timeline: the render of a 6429-character
+    post began at 41.449, twelve keypresses over the next five and a half
+    seconds produced no speech at all, and the log line saying the render had
+    finished -- `all of it by 7455 ms` -- is immediately followed by the next
+    utterance.  The user reported it as "speech stops until I alt tab", and
+    alt-tabbing had nothing to do with it: the wait simply ended.
+
+    The threshold is the same as the shorter test's, because the whole point
+    of retiring the host is that the cost of an interruption no longer has
+    anything to do with how long the abandoned utterance was.
+    """
+    _warm(driver)
+    fed0 = driver._player.fed
+    driver.speak(["The quick brown fox jumps over the lazy dog. " * 150])
+    assert _waitForFeeds(driver, fed0 + 1) > fed0, "the long post never started"
+
+    before = driver._player.bytes
+    driver.cancel()
+    started = time.perf_counter()
+    driver.speak(["next"])
+    end = started + 20.0
+    while time.perf_counter() < end:
+        if driver._player.bytes > before:
+            break
+        time.sleep(0.002)
+    waited = (time.perf_counter() - started) * 1000.0
+    assert driver._player.bytes > before, "the next utterance never arrived"
+    assert waited < 400.0, (
+        "interrupting a long post still costs %.0f ms before the next "
+        "utterance is heard" % waited)
+
+
+def test_cancel_does_not_block_while_an_utterance_is_rendering(driver):
+    """Rule 5, against the thing that now happens inside `cancel()`.
+
+    Retiring the host is process work, and `cancel()` runs on NVDA's main
+    thread -- the one that turns keystrokes into speech.  Doing it there would
+    trade a wait the user hears for a stall they type into, which is the worse
+    of the two.  So it is handed to a thread, and this measures that it was.
+    """
+    _warm(driver)
+    fed0 = driver._player.fed
+    driver.speak(["The quick brown fox jumps over the lazy dog. " * 150])
+    assert _waitForFeeds(driver, fed0 + 1) > fed0, "the long post never started"
+
+    started = time.perf_counter()
+    driver.cancel()
+    took = (time.perf_counter() - started) * 1000.0
+    assert took < 50.0, (
+        "cancel() took %.0f ms on the thread that must never wait" % took)
+
+
+def test_interrupting_over_and_over_leaves_one_engine_running(driver,
+                                                              monkeypatch):
+    """Arrowing a timeline, and what it leaves behind.
+
+    An interruption now costs a process, so the question the old driver never
+    had to answer is whether sixty of them in a row leak sixty of them.  They
+    are started by a thread and killed by a thread, and a burst of cancels
+    arrives faster than either finishes.
+    """
+    import leopardspeech
+    started = []
+    realPopen = leopardspeech.subprocess.Popen
+
+    def record(*a, **k):
+        proc = realPopen(*a, **k)
+        started.append(proc)
+        return proc
+
+    monkeypatch.setattr(leopardspeech.subprocess, "Popen", record)
+
+    _warm(driver)
+    for _ in range(60):
+        driver.cancel()
+        driver.speak(["The quick brown fox jumps over the lazy dog. " * 60])
+        time.sleep(0.06)
+
+    # Let the last retirement finish before counting: the kill and the
+    # replacement both happen off this thread.
+    end = time.perf_counter() + 10.0
+    while time.perf_counter() < end and driver._retiring:
+        time.sleep(0.01)
+    time.sleep(0.5)
+
+    alive = [p for p in started if p.poll() is None]
+    assert len(alive) == 1, (
+        "%d engines left running out of %d started"
+        % (len(alive), len(started)))
+
+    # And, above everything else, it still speaks -- rule 3.
+    before = driver._player.bytes
+    driver.cancel()
+    driver.speak(["still here"])
+    assert _settle(driver._player, before + 1, timeout=10.0) > before, (
+        "the synthesizer went silent after being interrupted repeatedly")
