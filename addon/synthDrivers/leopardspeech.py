@@ -638,6 +638,17 @@ class SynthDriver(SynthDriver):
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, startupinfo=si, env=env)
             self._watchStderr(self._proc)
+            # Which host served which utterance is the one link this chain has
+            # never been able to show.  Everything else about the abbreviation
+            # setting checks out in the log -- the setter fires on the right
+            # driver, the host restarts, and it prints the right flag -- so
+            # what is left is an utterance being served by a process other
+            # than the one whose startup was logged beside it.
+            log.debug("leopardspeech: host %d started; abbreviations %s, "
+                      "phrasing %r"
+                      % (self._proc.pid,
+                         "on" if self._expandAbbreviations else "OFF",
+                         self._phrasing))
             return self._proc
 
     def _abandonHost(self):
@@ -883,6 +894,8 @@ class SynthDriver(SynthDriver):
         answered = False
         try:
             proc = self._host()
+            log.debug("leopardspeech: utterance -> host %d: %r"
+                      % (proc.pid, text[:60]))
             v = voice.encode("utf-8")
             t = _encode(text)
             # A cancel that arrived while nothing was rendering must not be
