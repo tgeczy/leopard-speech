@@ -1461,8 +1461,41 @@ class SynthDriver(SynthDriver):
     def _set_phrasing(self, value):
         value = value if value in self.PHRASING else "fewest"
         if value != self._phrasing:
+            self._logSettingChange("phrasing", self._phrasing, value)
             self._phrasing = value
             self._restartHost()
+
+    def _logSettingChange(self, name, was, now):
+        """Say who changed an engine setting, and to what.
+
+        NVDA applies a checkbox to the driver the moment it is ticked, but
+        writes it to configuration only when the dialog is saved -- and
+        `loadSettings(onlyChanged=True)` re-applies the *configured* value on
+        every config-profile switch (`synthDriverHandler.py:584`), with a full
+        reload on Cancel (`settingsDialogs.py:1586`).  So an unsaved toggle can
+        be reverted by something the user never associated with the setting,
+        which is exactly the "sometimes it sticks, sometimes it doesn't" this
+        line exists to prove or disprove.
+
+        The caller is what distinguishes the two: a change from the dialog
+        arrives under `_onCheckChanged`, a revert under `_loadSpecificSettings`.
+        """
+        try:
+            import traceback
+            who = "?"
+            for frame in reversed(traceback.extract_stack()[:-2]):
+                if "leopardspeech" not in frame.filename:
+                    who = "%s:%d %s" % (os.path.basename(frame.filename),
+                                        frame.lineno, frame.name)
+                    break
+            # The driver's identity matters: NVDA can hold more than one
+            # instance alive, and a checkbox bound to a retired one would
+            # change a setting nothing is speaking through -- which looks
+            # exactly like "sometimes it does not stick".
+            log.debug("leopardspeech: %s %r -> %r on driver %#x, from %s"
+                      % (name, was, now, id(self), who))
+        except Exception:
+            pass
 
     def _get_expandAbbreviations(self):
         return self._expandAbbreviations
@@ -1470,6 +1503,8 @@ class SynthDriver(SynthDriver):
     def _set_expandAbbreviations(self, value):
         value = bool(value)
         if value != self._expandAbbreviations:
+            self._logSettingChange("expandAbbreviations",
+                                   self._expandAbbreviations, value)
             self._expandAbbreviations = value
             self._restartHost()
 
