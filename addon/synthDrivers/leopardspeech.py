@@ -132,6 +132,10 @@ INFLECTION_MAX_PMOD = 200
 #: An embedded speech command, as the engine's front end parses it.  Non-greedy, and
 #: it will not run past a newline, so an unclosed "[[" cannot eat a paragraph.
 COMMAND_RE = re.compile(r"\[\[[^\]]{0,64}\]\]")
+#: The same thing, capturing, for splitting text into "command" and "not a
+#: command" runs.  `re.split` keeps the separators only when the pattern has a
+#: group -- without one it deletes every command it splits on.
+COMMAND_SPLIT_RE = re.compile(r"(\[\[[^\]]{0,64}\]\])")
 
 #: Characters MacRoman has no room for, mapped to something it can say.
 #: Everything typographic that matters -- em dash, en dash, curly quotes,
@@ -288,6 +292,10 @@ if _ENGINE_DIR not in sys.path:
 # The alias keeps the body of this file reading `tree.` while the module that
 # is actually loaded has a name no one else will claim.
 import leopardtree as tree                                    # noqa: E402
+#: Prefixed for the same reason, and one worse: `numbers` is a module in
+#: Python's own standard library, and this folder is at the front of
+#: `sys.path`, so a file of that name would shadow it for the whole of NVDA.
+import leopardnumbers                                         # noqa: E402
 
 HOST_EXE = tree.HOST_EXE
 find_tree = tree.find_tree
@@ -430,6 +438,16 @@ class SynthDriver(SynthDriver):
             _("Brea&the between sentences when reading continuously"),
             defaultVal=True,
         ),
+        # The engine reads numbers well up to six digits and gives up at
+        # seven -- "3222233" comes out one digit at a time.  It is not tunable:
+        # all 283 engine parameters are prosody and unit selection, and number
+        # reading lives in SpeechDictionary, which takes no settings.  So the
+        # repair is in the text, before the engine sees it.
+        DriverSetting(
+            "numberStyle",
+            _("&Number reading"),
+            defaultVal="fix",
+        ),
         BooleanDriverSetting(
             "expandAbbreviations",
             _("Expand &abbreviations (5KB, 1,234MB, 20ish)"),
@@ -491,6 +509,7 @@ class SynthDriver(SynthDriver):
         self._phrasing = "fewest"
         self._expandAbbreviations = True
         self._joinSentences = True
+        self._numberStyle = "fix"
         #: Whether anything has been spoken since the last cancel.  Joining
         #: never waits for the *first* utterance of a run, so starting to read
         #: is as immediate as it was; from the second on, the next line is
@@ -901,6 +920,15 @@ class SynthDriver(SynthDriver):
             # produce silence instead of speaking it.  The host separately
             # guarantees no command can outlive its utterance.
             text = COMMAND_RE.sub("", text)
+        if self._numberStyle != "off":
+            #: Only between the commands, never inside one.  With embedded
+            #: commands accepted, "[[rate 200]]" is still in the text at this
+            #: point, and rewriting the 200 inside it would leave the engine
+            #: reading "[[rate two hundred]]" as an unparseable command.
+            text = "".join(
+                part if part.startswith("[[")
+                else leopardnumbers.expand(part, self._numberStyle)
+                for part in COMMAND_SPLIT_RE.split(text))
         # Volume is the engine's own [[volm]] command, not gain applied to
         # the PCM afterwards.  Measured on both engines it is exactly
         # linear -- volm 0.5 halves the RMS and 0.2 fifths it -- so the
@@ -1707,6 +1735,29 @@ class SynthDriver(SynthDriver):
                                    self._expandAbbreviations, value)
             self._expandAbbreviations = value
             self._restartHost()
+
+    def _get_availableNumberstyles(self):
+        from collections import OrderedDict
+        return OrderedDict((
+            ("off", StringParameterInfo("off", _("Leopard's own"))),
+            # What is actually broken, and nothing else: seven digits and up
+            # get their separators back, because the engine reads "1,234,567"
+            # correctly and keeps its own phrasing that way; and a leading zero
+            # is written out, because "0.7.3" loses it altogether.
+            ("fix", StringParameterInfo("fix", _("Fix long numbers"))),
+            ("words", StringParameterInfo("words", _("All numbers as words"))),
+        ))
+
+    def _get_numberStyle(self):
+        return self._numberStyle
+
+    def _set_numberStyle(self, value):
+        #: Text is rewritten per utterance, so this needs no host restart and
+        #: takes effect on the very next thing spoken.
+        value = value if value in ("off", "fix", "words") else "fix"
+        if value != self._numberStyle:
+            self._logSettingChange("numberStyle", self._numberStyle, value)
+            self._numberStyle = value
 
     def _get_joinSentences(self):
         return self._joinSentences
