@@ -220,6 +220,33 @@ def _joinFragments(parts):
     return "".join(out)
 
 
+#: The end of a sentence, in the shape NVDA itself uses
+#: (`speech/speechWithoutPauses.py`), so what we count as a boundary is what
+#: NVDA counted as one when it decided to hand the line over.
+SENTENCE_END_RE = re.compile(u"[.!?][\"'”’)\\]]*(?:\\s|$)")
+
+
+def _sentenceEnds(text):
+    """How many sentences have finished inside this text.
+
+    **Two is the number that matters.**  A breath is not a gap the engine
+    inserts, it is a unit it selects, and it only ever selects one at a
+    sentence boundary *inside* one utterance.  So one sentence -- however long
+    -- can never breathe, and two breathe once, at the join.  Measured on Alex:
+    1 sentence -> 0 breaths, 2 -> 1, 3 -> 2, 6 -> 5.
+    """
+    return len(SENTENCE_END_RE.findall(text))
+
+
+#: How long to hold a finished sentence hoping the next one arrives.  Only ever
+#: waited once speech is already flowing, so it delays the start of nothing --
+#: and by then the next line is usually queued already, making the wait zero.
+JOIN_WAIT = 0.35
+#: And never hold more than this, however the text is punctuated: a page with
+#: no full stop in it must not accumulate until the reader notices.
+JOIN_MAX_CHARS = 800
+
+
 REQ_MAGIC = 0x54475233          # 'TGR3'
 #: The same audio, in chunks, as the engine produces it.
 #:
@@ -380,6 +407,29 @@ class SynthDriver(SynthDriver):
             defaultVal="fewest",
             availableInSettingsRing=True,
         ),
+        # Where the breathing went, and how to get it back.
+        #
+        # Alex breathes at a sentence boundary *inside* one utterance and
+        # nowhere else -- N sentences give N-1 breaths, measured 0/1/2/5 for
+        # 1/2/3/6 sentences.  Reading continuously, NVDA hands over one
+        # finished sentence at a time (`speechWithoutPauses` flushes at the
+        # last full stop it can find), so there is no boundary inside anything
+        # we are given and nothing ever breathes.  Tomi: "it does do it
+        # occasionally but not nearly as much as I recall" -- occasionally is
+        # when a line happened to carry two full stops.
+        #
+        # So this holds a finished sentence briefly and speaks it together with
+        # the next one.  The cost is that the cursor leads what is being said
+        # by up to one extra sentence, which is why it is a setting and not
+        # simply the behaviour.
+        BooleanDriverSetting(
+            "joinSentences",
+            # Says the benefit, not the mechanism: nobody wants "coalesce
+            # utterances", they want the thing it produces.  T is free -- E, R,
+            # G, B and A are taken above.
+            _("Brea&the between sentences when reading continuously"),
+            defaultVal=True,
+        ),
         BooleanDriverSetting(
             "expandAbbreviations",
             _("Expand &abbreviations (5KB, 1,234MB, 20ish)"),
@@ -440,6 +490,12 @@ class SynthDriver(SynthDriver):
         #: once at startup, so changing either restarts the host.
         self._phrasing = "fewest"
         self._expandAbbreviations = True
+        self._joinSentences = True
+        #: Whether anything has been spoken since the last cancel.  Joining
+        #: never waits for the *first* utterance of a run, so starting to read
+        #: is as immediate as it was; from the second on, the next line is
+        #: normally queued already and the wait is zero anyway.
+        self._spokeSinceCancel = False
         #: Whether a non-default volume or inflection has been sent to the
         #: engine and is still in force on the channel.
         self._volumeSent = False
@@ -1013,6 +1069,7 @@ class SynthDriver(SynthDriver):
             if item is None:
                 break
             epoch = self._epoch
+            item = self._join(item, epoch)
             wpm, voice = self._wpm(), self._voiceId
             #: What NVDA has asked us to add to the user's pitch for the
             #: text that follows -- how "capital pitch change percentage"
@@ -1053,7 +1110,94 @@ class SynthDriver(SynthDriver):
             for index in pending:               # nothing left to speak
                 self._audioQueue.put(("index", index, None))
             del pending[:]
+            self._spokeSinceCancel = True
             self._audioQueue.put(("done", None, None))
+
+    def _reportIndexes(self, items):
+        """Report the indexes in `items` now, and hand back everything else.
+
+        **They cannot wait for the text.** Reading continuously, NVDA asks for
+        the next line from `lineReached`, and `lineReached` is this
+        notification -- so holding an index while holding its sentence means
+        the next sentence never arrives and the reader simply stops. `_flush`
+        already reports indexes ahead of their audio for the same reason; this
+        moves them earlier still, by however long the sentence is held.
+
+        The cost is the one this feature has: the cursor leads what is being
+        spoken by up to one extra sentence.
+        """
+        rest = []
+        for kind, value in items:
+            if kind == "index":
+                self._audioQueue.put(("index", value, None))
+            else:
+                rest.append((kind, value))
+        return rest
+
+    def _join(self, item, epoch):
+        """Group finished sentences so the engine has a boundary to breathe at.
+
+        Alex breathes at a sentence boundary **inside** one utterance and
+        nowhere else: measured, 1 sentence gives 0 breaths, 2 give 1, 3 give 2,
+        6 give 5.  Reading continuously NVDA hands over one finished sentence
+        at a time -- `speechWithoutPauses` flushes at the last full stop it can
+        find -- so there is never a boundary inside what we are given, and
+        nothing ever breathes.  Holding one sentence until the next arrives is
+        the whole fix; the engine does the rest by itself.
+
+        Bounded three ways, because an unbounded hold is a synthesizer that
+        stops talking: two sentences is enough, `JOIN_MAX_CHARS` covers text
+        with no full stop in it, and `JOIN_WAIT` covers the end of a document,
+        where no next line is coming at all.  NVDA never tells a driver that an
+        utterance was the last one -- it splits sequences at
+        `EndUtteranceCommand` before we see them -- so the timeout is not a
+        safety net, it is the mechanism for the final sentence.
+        """
+        if not self._joinSentences:
+            return item
+        #: Only while reading continuously.  NVDA marks those lines with an
+        #: index; nothing else it sends this driver carries one, so an index is
+        #: both the signal that more text is coming and the thing that asks for
+        #: it.  Without this, arrowing through a list would be held too.
+        if not any(kind == "index" for kind, _ in item):
+            return item
+        #: A break or a pitch change divides the utterance where it stands, so
+        #: joining across one would promise a boundary that is not there.
+        if any(kind in ("break", "pitch") for kind, _ in item):
+            return item
+
+        items = self._reportIndexes(item)
+        text = _joinFragments([v for k, v in items if k == "text"])
+        while (_sentenceEnds(text) < 2 and len(text) < JOIN_MAX_CHARS
+               and not self._stopped and self._epoch == epoch):
+            #: Two conditions before this is allowed to *block*, and between
+            #: them they leave every latency that matters exactly as it was:
+            #:
+            #: - not the first utterance after a cancel, so starting to read is
+            #:   as immediate as it ever was;
+            #: - and there is a finished sentence in hand.  NVDA hands over
+            #:   text that ends at a full stop, so something arriving without
+            #:   one is not a line of a document -- it is an announcement that
+            #:   happens to carry an index, and holding it would be heard as
+            #:   the synthesizer lagging.
+            #:
+            #: Either way it still absorbs whatever is *already* queued, which
+            #: while reading continuously is usually the next line in any case.
+            block = self._spokeSinceCancel and _sentenceEnds(text) >= 1
+            try:
+                nxt = self._queue.get(timeout=JOIN_WAIT if block else 0)
+            except queue.Empty:
+                break
+            if nxt is None:
+                #: terminate().  Put it back for the loop that owns it.
+                self._queue.put(None)
+                break
+            if any(kind in ("break", "pitch") for kind, _ in nxt):
+                items.extend(nxt)
+                break
+            items.extend(self._reportIndexes(nxt))
+            text = _joinFragments([v for k, v in items if k == "text"])
+        return items
 
     def _flush(self, run, wpm, voice, adj, epoch, pending=None):
         """Render the text collected so far as ONE utterance.
@@ -1315,6 +1459,9 @@ class SynthDriver(SynthDriver):
         left interruption silently broken while sound was still playing.
         """
         self._epoch += 1
+        #: Whatever was being held for joining belongs to the run that has just
+        #: been cancelled, and the next utterance must not wait behind it.
+        self._spokeSinceCancel = False
         # Reach the engine before draining anything: whatever it is rendering
         # now is audio for an utterance already abandoned, and the next one
         # cannot start until that response ends.
@@ -1443,12 +1590,52 @@ class SynthDriver(SynthDriver):
     #: of more breaking than Leopard does by itself, which is why every
     #: position sounded busier than the default.  Negative values are where
     #: "fewer" lives, and it saturates by -10: -100 renders identically.
+    #: **Measured 2026-08-19**, seventeen thresholds against three texts.  The
+    #: parameter does not respond smoothly, and there are far fewer distinct
+    #: behaviours than there are numbers:
+    #:
+    #:   "Restart with debug logging enabled"   every value from -20 to +8 is
+    #:                                          BYTE-IDENTICAL.  Only unanswered
+    #:                                          differs -- 2.06 s against
+    #:                                          1.54 s, with 229 ms and 120 ms
+    #:                                          breaks that fence "logging".
+    #:   the news paragraph        -20/-10/-8 | -5/-4 | -3..3 | 4/5/6/8
+    #:   three short sentences     -20..-3    | -2..4 | 5/6/8
+    #:
+    #: The old ladder put -2.0 and +2.0 both inside the -3..3 class, so "fewer"
+    #: and "more" rendered **byte-identical** -- two of five positions doing
+    #: exactly the same thing.  That is what Tomi heard as "most doesn't bring
+    #: it back up like Leopard original does".
+    #:
+    #: Two values count as the same behaviour only when they are identical on
+    #: *every* text, which leaves six numeric classes to choose from, not the
+    #: three a stricter reading suggests.  These four are pairwise
+    #: byte-distinct, and the pause count rises across them on both long texts:
+    #:
+    #:                    news paragraph   three sentences
+    #:   fewest  -8             14 gaps         11
+    #:   fewer   -4             19              11
+    #:   more     0             25              14
+    #:   most     5             33              17
+    #:
+    #: Frames rise with them too (348230 / 370830 / 392056 / 427597), so the
+    #: ordering is not an artefact of how a gap is counted.  `-8` rather than
+    #: `-10` and `-4` rather than `-5` only because they are the same bytes and
+    #: sit closer to the live range; `0` is the value already confirmed by ear.
+    #:
+    #: **Leopard's own is deliberately last, off the end of that ladder.** It
+    #: is not a threshold, it is the parameter left unanswered, and it has no
+    #: fixed rank: on the paragraph it falls between `fewest` and `fewer`, on
+    #: three sentences between `fewer` and `more`, and on a short phrase it is
+    #: far above all of them -- the only position that puts 229 ms and 120 ms
+    #: breaks inside "Restart with debug logging enabled", which is the
+    #: complaint this whole setting began with.
     PHRASING = {
-        "fewest":  -10.0,
-        "fewer":    -2.0,
+        "fewest":   -8.0,
+        "fewer":    -4.0,
+        "more":      0.0,
+        "most":      5.0,
         "leopard":  None,
-        "more":      2.0,
-        "most":      8.0,
     }
 
     def _get_availablePhrasings(self):
@@ -1456,9 +1643,9 @@ class SynthDriver(SynthDriver):
         return OrderedDict((
             ("fewest", StringParameterInfo("fewest", _("Fewest pauses"))),
             ("fewer", StringParameterInfo("fewer", _("Fewer pauses"))),
-            ("leopard", StringParameterInfo("leopard", _("Leopard's own"))),
             ("more", StringParameterInfo("more", _("More pauses"))),
             ("most", StringParameterInfo("most", _("Most pauses"))),
+            ("leopard", StringParameterInfo("leopard", _("Leopard's own"))),
         ))
 
     def _phrasingParam(self):
@@ -1520,6 +1707,17 @@ class SynthDriver(SynthDriver):
                                    self._expandAbbreviations, value)
             self._expandAbbreviations = value
             self._restartHost()
+
+    def _get_joinSentences(self):
+        return self._joinSentences
+
+    def _set_joinSentences(self, value):
+        #: Nothing to restart: this only changes how the worker groups what is
+        #: already queued, so it takes effect on the very next utterance.
+        value = bool(value)
+        if value != self._joinSentences:
+            self._logSettingChange("joinSentences", self._joinSentences, value)
+            self._joinSentences = value
 
     #: How much silence to put where NVDA split the sequence, in milliseconds.
     PAUSE_MS = {"short": 0, "medium": 60, "long": 150}
