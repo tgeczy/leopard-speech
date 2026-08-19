@@ -340,6 +340,23 @@ class SynthDriver(SynthDriver):
             _("&Pause between phrases"),
             defaultVal="short",
         ),
+        # The engine breaks phrases where no author put one -- "restart with
+        # debug, logging, enabled" -- because it asks how strong a boundary has
+        # to be and, until now, was told nothing.  On by default, because the
+        # default *is* the complaint; off restores Leopard's own phrasing.
+        BooleanDriverSetting(
+            "naturalPhrasing",
+            _("&Natural phrasing (fewer mid-sentence pauses)"),
+            defaultVal=True,
+        ),
+        # Leopard's dictionary has rules for KB, 20ish, 1,234MB and Roman
+        # numerals.  Every one of them was dead until the pattern reader became
+        # a real one, so "off" is what this add-on has always sounded like.
+        BooleanDriverSetting(
+            "expandAbbreviations",
+            _("Expand &abbreviations (KB, 20ish, Roman numerals)"),
+            defaultVal=True,
+        ),
     )
     supportedCommands = {speech.commands.IndexCommand,
                          speech.commands.BreakCommand,
@@ -391,6 +408,10 @@ class SynthDriver(SynthDriver):
         self._rateBoost = False
         self._inflection = 50
         self._volume = 100
+        #: Both reach the engine through the host's environment, which is read
+        #: once at startup, so changing either restarts the host.
+        self._naturalPhrasing = True
+        self._expandAbbreviations = True
         #: Whether a non-default volume or inflection has been sent to the
         #: engine and is still in force on the channel.
         self._volumeSent = False
@@ -534,6 +555,18 @@ class SynthDriver(SynthDriver):
                 env.pop("TIGER_HOST_VERBOSE", None)
             if self._cancelEvent:
                 env["TIGER_CANCEL_EVENT"] = self._cancelEventName
+            # The engine asks how strong a phrase boundary has to be before it
+            # is worth a silence, and answering 0 stops it breaking clauses
+            # nobody wrote.  Unanswered, it uses its own default, which is
+            # what every version before this one did.
+            if self._naturalPhrasing:
+                env["TIGER_PARAMS"] = "Boundaries.SilThreshold=0"
+            else:
+                env.pop("TIGER_PARAMS", None)
+            if self._expandAbbreviations:
+                env.pop("TIGER_NO_ABBREV", None)
+            else:
+                env["TIGER_NO_ABBREV"] = "1"
             self._proc = subprocess.Popen(
                 [HOST_EXE, "--serve", self._mt, self._sd, self._voicesdir],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1188,6 +1221,44 @@ class SynthDriver(SynthDriver):
 
     def _set_acceptCommands(self, value):
         self._acceptCommands = bool(value)
+
+    def _restartHost(self):
+        """Drop the engine process so the next utterance starts a fresh one.
+
+        Both engine settings are read from the environment when the host
+        starts, so a change cannot reach the process already running.  Stop
+        first: killing a host mid-utterance would otherwise leave the audio it
+        had already handed over playing under the new one."""
+        self.cancel()
+        with self._procLock:
+            proc, self._proc = self._proc, None
+        if proc is not None:
+            try:
+                proc.stdin.close()
+                proc.wait(timeout=1)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def _get_naturalPhrasing(self):
+        return self._naturalPhrasing
+
+    def _set_naturalPhrasing(self, value):
+        value = bool(value)
+        if value != self._naturalPhrasing:
+            self._naturalPhrasing = value
+            self._restartHost()
+
+    def _get_expandAbbreviations(self):
+        return self._expandAbbreviations
+
+    def _set_expandAbbreviations(self, value):
+        value = bool(value)
+        if value != self._expandAbbreviations:
+            self._expandAbbreviations = value
+            self._restartHost()
 
     #: How much silence to put where NVDA split the sequence, in milliseconds.
     PAUSE_MS = {"short": 0, "medium": 60, "long": 150}

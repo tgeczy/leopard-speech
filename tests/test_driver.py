@@ -1132,3 +1132,87 @@ def test_inflection_comes_back_to_the_middle_too(driver, monkeypatch):
     assert seen and "[[pmod" not in seen[0], (
         "the command is still being sent after the setting came back: %r"
         % (seen,))
+
+
+def test_natural_phrasing_removes_a_break_the_engine_invented(driver):
+    """The complaint, in one assertion.
+
+    "Restart with debug logging enabled" came out with 191 ms of silence after
+    "debug" and 94 ms after "logging" -- the word fenced on both sides, which
+    listeners described as hearing it in quotes.  Whisper transcribed the same
+    render as *"restart with debug, logging and enabled."*, commas and all.
+
+    None of that is the phrasing dictionary: the same text matches zero rows in
+    Leopard's table, in Mountain Lion's, and in a merged one, and all three
+    render byte-identically.  It is `Boundaries.SilThreshold`, which the engine
+    asks for and was never told.
+    """
+    text = "restart with debug logging enabled"
+    voice = driver._get_voice()
+    _warm(driver)
+
+    driver._set_naturalPhrasing(False)
+    plain = driver._render(text, driver._wpm(), voice)
+    driver._set_naturalPhrasing(True)
+    natural = driver._render(text, driver._wpm(), voice)
+    driver._set_naturalPhrasing(True)
+
+    assert plain and natural
+    assert natural != plain, "the setting never reached the engine"
+    # The break is silence, so removing it can only make the utterance shorter.
+    assert len(natural) < len(plain), "natural phrasing did not shorten the gap"
+
+    def gaps(pcm, floor=300, least=772):
+        import struct
+        v = struct.unpack("<%dh" % (len(pcm) // 2), pcm)
+        runs, start, first, last = [], None, None, None
+        for i, s in enumerate(v):
+            if abs(s) >= floor:
+                if first is None:
+                    first = i
+                last = i
+                if start is not None and i - start >= least:
+                    runs.append((start, i))
+                start = None
+            elif start is None:
+                start = i
+        return [(a, b) for a, b in runs
+                if first is not None and a > first and b < last]
+
+    assert len(gaps(natural)) < len(gaps(plain)), \
+        "the same number of interior silences survived"
+
+
+def test_the_settings_default_to_the_better_behaviour(driver):
+    """Both defaults are deliberate, and both are a change.
+
+    Every release before this one phrased the way the engine's own defaults do
+    and had every abbreviation rule refused, so upgrading changes how the
+    synthesizer sounds.  That is the point -- but it is the kind of thing to
+    state in a test, so nobody flips it back by accident.
+    """
+    assert driver._get_naturalPhrasing() is True
+    assert driver._get_expandAbbreviations() is True
+
+
+def test_turning_a_setting_off_restarts_the_engine(driver):
+    """The host reads both settings once, when it starts.
+
+    So a change that does not restart the process is a change the user cannot
+    hear until they switch synthesizers -- which is exactly how the first
+    attempt at this failed, with an environment variable that never reached
+    NVDA's child.
+    """
+    _warm(driver)
+    before = driver._host()
+    driver._set_expandAbbreviations(False)
+    after = driver._host()
+    # Assert *before* putting the setting back: restoring it restarts the host
+    # again, which would kill the very process being examined.  The first
+    # version of this test did that and failed on its own tidying up.
+    assert after is not before, "the engine kept running with the old setting"
+    assert after.poll() is None, "the replacement engine is not alive"
+    assert before.poll() is not None, "the old engine was left running"
+    # And it still speaks afterwards.
+    assert driver._render("one two three", driver._wpm(), driver._get_voice())
+    driver._set_expandAbbreviations(True)
