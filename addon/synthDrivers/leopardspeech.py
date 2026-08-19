@@ -72,7 +72,8 @@ import queue
 import nvwave
 import speech.commands
 from logHandler import log
-from autoSettingsUtils.driverSetting import BooleanDriverSetting, DriverSetting
+from autoSettingsUtils.driverSetting import (BooleanDriverSetting, DriverSetting,
+                                             NumericDriverSetting)
 from autoSettingsUtils.utils import StringParameterInfo
 from synthDriverHandler import (SynthDriver, VoiceInfo, synthDoneSpeaking,
                                 synthIndexReached)
@@ -340,24 +341,34 @@ class SynthDriver(SynthDriver):
             _("&Pause between phrases"),
             defaultVal="short",
         ),
-        # The engine breaks phrases where no author put one -- "restart with
-        # debug, logging, enabled" -- because it asks how strong a boundary has
-        # to be and, until now, was told nothing.  On by default, because the
-        # default *is* the complaint; off restores Leopard's own phrasing.
-        BooleanDriverSetting(
-            "naturalPhrasing",
-            _("&Natural phrasing (fewer mid-sentence pauses)"),
-            defaultVal=True,
-        ),
-        # Leopard's dictionary rewrites a quantity followed by a unit and the
-        # -ish suffix.  Both were dead until the pattern reader became a real
-        # one, so "off" is what this add-on has always sounded like.
+        # How readily the engine breaks a phrase.  It asks how strong a
+        # boundary must be before it earns a silence, and until now was told
+        # nothing, so it used its own default.
         #
-        # The examples in the label are the forms that actually fire.  A bare
-        # "KB" does not: the rule is quantity-then-capitals, so "5KB" is
-        # rewritten and "KB" on its own is not.  The first version of this
-        # label said "KB", and Tomi read the label itself aloud to test the
-        # setting -- which changed nothing, exactly as the engine intends.
+        # Named values rather than a slider, because a number here is genuinely
+        # ambiguous -- Tomi asked it straight: "does setting it to 0 cause
+        # phrases to break more often, or 100?  At 0 you're telling the engine
+        # don't break up phrases, but 0 could equally mean the setting is off."
+        # Both readings are reasonable, so the control says which it means.
+        #
+        # Measured on Alex at 300 wpm, interior silences:
+        #
+        #                    "restart with debug   the quoted sentence
+        #                     logging enabled"
+        #   fewest            1 gap                6 gaps, no 142 ms one
+        #   fewer             1 gap                8 gaps
+        #   Leopard's own     2 gaps: 191, 94 ms   7 gaps, incl. 142 ms
+        #   more / most       1 gap                9 gaps
+        #
+        # "Fewest" is the default because it is the only setting that is best
+        # on every sentence tested -- and note that Leopard's own is the worst
+        # of them on the first, which is the complaint this began with.
+        DriverSetting(
+            "phrasing",
+            _("Phrase &pauses"),
+            defaultVal="fewest",
+            availableInSettingsRing=True,
+        ),
         BooleanDriverSetting(
             "expandAbbreviations",
             _("Expand &abbreviations (5KB, 1,234MB, 20ish)"),
@@ -416,7 +427,7 @@ class SynthDriver(SynthDriver):
         self._volume = 100
         #: Both reach the engine through the host's environment, which is read
         #: once at startup, so changing either restarts the host.
-        self._naturalPhrasing = True
+        self._phrasing = "fewest"
         self._expandAbbreviations = True
         #: Whether a non-default volume or inflection has been sent to the
         #: engine and is still in force on the channel.
@@ -433,6 +444,9 @@ class SynthDriver(SynthDriver):
                 break
 
         self._proc = None
+        #: Set when an engine setting changes; acted on in _host(), between
+        #: utterances, rather than by killing a host that may be mid-stream.
+        self._restartWanted = False
         self._procLock = threading.Lock()
         self._stopped = False
         #: Bumped by cancel(). Read by the worker *after* it takes an item off
@@ -540,6 +554,21 @@ class SynthDriver(SynthDriver):
         dies.  Startup costs about 20 ms including the 2.1 MB dictionary, so a
         restart after a crash is not something the user would notice."""
         with self._procLock:
+            if self._restartWanted and self._proc is not None:
+                # A setting changed.  Retire the old process here, between
+                # utterances, where closing its pipe cannot be mistaken for a
+                # protocol failure -- see _restartHost().
+                self._restartWanted = False
+                old, self._proc = self._proc, None
+                try:
+                    old.stdin.close()
+                    old.wait(timeout=1)
+                except Exception:
+                    try:
+                        old.kill()
+                    except Exception:
+                        pass
+            self._restartWanted = False
             if self._proc is not None and self._proc.poll() is None:
                 return self._proc
             si = subprocess.STARTUPINFO()
@@ -565,8 +594,9 @@ class SynthDriver(SynthDriver):
             # is worth a silence, and answering 0 stops it breaking clauses
             # nobody wrote.  Unanswered, it uses its own default, which is
             # what every version before this one did.
-            if self._naturalPhrasing:
-                env["TIGER_PARAMS"] = "Boundaries.SilThreshold=0"
+            params = self._phrasingParam()
+            if params:
+                env["TIGER_PARAMS"] = params
             else:
                 env.pop("TIGER_PARAMS", None)
             if self._expandAbbreviations:
@@ -1229,32 +1259,61 @@ class SynthDriver(SynthDriver):
         self._acceptCommands = bool(value)
 
     def _restartHost(self):
-        """Drop the engine process so the next utterance starts a fresh one.
+        """Ask for a fresh engine process before the next utterance.
 
         Both engine settings are read from the environment when the host
-        starts, so a change cannot reach the process already running.  Stop
-        first: killing a host mid-utterance would otherwise leave the audio it
-        had already handed over playing under the new one."""
-        self.cancel()
-        with self._procLock:
-            proc, self._proc = self._proc, None
-        if proc is not None:
-            try:
-                proc.stdin.close()
-                proc.wait(timeout=1)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+        starts, so a change cannot reach a process already running.
 
-    def _get_naturalPhrasing(self):
-        return self._naturalPhrasing
+        **Ask, rather than kill.**  The first version closed the host's stdin
+        here, on NVDA's thread, while the worker could be halfway through a
+        streamed utterance -- and a pipe that closes mid-stream is exactly how
+        an engine too old to stream announces itself, so the driver switched
+        streaming off for the rest of the session and told the user to
+        reinstall.  Toggling a checkbox twice was enough to do it.
 
-    def _set_naturalPhrasing(self, value):
-        value = bool(value)
-        if value != self._naturalPhrasing:
-            self._naturalPhrasing = value
+        So the swap happens where it is safe: `_host()` runs at the start of
+        each render, on the worker thread, with nothing in flight."""
+        self._restartWanted = True
+
+    #: What each choice tells the engine.  `None` means it is told nothing,
+    #: which is not the same as being told a number: unanswered is Leopard's
+    #: own model, and it sits in the *middle* of what can be asked for.  The
+    #: first version of this ran 0 to 8 and was therefore entirely on the side
+    #: of more breaking than Leopard does by itself, which is why every
+    #: position sounded busier than the default.  Negative values are where
+    #: "fewer" lives, and it saturates by -10: -100 renders identically.
+    PHRASING = {
+        "fewest":  -10.0,
+        "fewer":    -2.0,
+        "leopard":  None,
+        "more":      2.0,
+        "most":      8.0,
+    }
+
+    def _get_availablePhrasings(self):
+        from collections import OrderedDict
+        return OrderedDict((
+            ("fewest", StringParameterInfo("fewest", _("Fewest pauses"))),
+            ("fewer", StringParameterInfo("fewer", _("Fewer pauses"))),
+            ("leopard", StringParameterInfo("leopard", _("Leopard's own"))),
+            ("more", StringParameterInfo("more", _("More pauses"))),
+            ("most", StringParameterInfo("most", _("Most pauses"))),
+        ))
+
+    def _phrasingParam(self):
+        """-> the TIGER_PARAMS value for the current choice, or None."""
+        threshold = self.PHRASING.get(self._phrasing, -10.0)
+        if threshold is None:
+            return None
+        return "Boundaries.SilThreshold=%g" % threshold
+
+    def _get_phrasing(self):
+        return self._phrasing
+
+    def _set_phrasing(self, value):
+        value = value if value in self.PHRASING else "fewest"
+        if value != self._phrasing:
+            self._phrasing = value
             self._restartHost()
 
     def _get_expandAbbreviations(self):

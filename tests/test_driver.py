@@ -1151,11 +1151,11 @@ def test_natural_phrasing_removes_a_break_the_engine_invented(driver):
     voice = driver._get_voice()
     _warm(driver)
 
-    driver._set_naturalPhrasing(False)
+    driver._set_phrasing("leopard")   # Leopard's own model
     plain = driver._render(text, driver._wpm(), voice)
-    driver._set_naturalPhrasing(True)
+    driver._set_phrasing("fewest")    # answered, fewest breaks
     natural = driver._render(text, driver._wpm(), voice)
-    driver._set_naturalPhrasing(True)
+    driver._set_phrasing("fewest")    # answered, fewest breaks
 
     assert plain and natural
     assert natural != plain, "the setting never reached the engine"
@@ -1191,7 +1191,7 @@ def test_the_settings_default_to_the_better_behaviour(driver):
     synthesizer sounds.  That is the point -- but it is the kind of thing to
     state in a test, so nobody flips it back by accident.
     """
-    assert driver._get_naturalPhrasing() is True
+    assert driver._get_phrasing() == "fewest"
     assert driver._get_expandAbbreviations() is True
 
 
