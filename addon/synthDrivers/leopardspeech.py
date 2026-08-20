@@ -1567,21 +1567,30 @@ class SynthDriver(SynthDriver):
             self._audioQueue.put(("audio", chunk, epoch))
             return True
 
-        # Long text goes to the engine a sentence at a time.
+        # Long text goes to the engine a sentence at a time -- but only when
+        # the host cannot stream.
         #
-        # The engine renders at a steady 14 to 19 times real time, so the
-        # wait before the first sound is set by how much audio has to
-        # exist before any of it may be heard -- the whole utterance,
-        # because the host answers in one chunk.  Measured on one 792
-        # character post, three times: 1323, 1383 and 1369 ms.
+        # Splitting was measured against a host answering in one chunk, where
+        # the wait before the first sound is set by how much audio has to exist
+        # before any of it may be heard: 1323, 1383 and 1369 ms on one 792
+        # character post.  Rendering the first sentence alone costs a fraction
+        # of that.  Against a *streaming* host it buys nothing at all, because
+        # the first chunk is already on its way while the rest renders --
+        # measured on this driver, same text: 33.4 ms split against 30.8 ms
+        # whole.
         #
-        # Rendering the first sentence alone costs a fraction of that, and
-        # the rest is rendered while it plays.  **Only at sentence ends**,
-        # and only for text long enough to be worth it -- see
-        # _sentenceStarts, which refuses every boundary it cannot prove.
-        # Splitting anywhere else is what this driver joins NVDA's
-        # fragments together to avoid.
-        pieces = _splitUtterance(text)
+        # And it is not free.  A sentence end is exactly where Alex breathes:
+        # N sentences in one utterance give N-1 breaths, at the boundaries and
+        # nowhere else, so cutting there is cutting the breath out.  Measured
+        # on a four-sentence paragraph, whole against split into three: 9
+        # pauses of 70 ms or more against 5, and 1.36 s of silence against
+        # 1.08.  That is the same trade the streaming plan turned down, and it
+        # is the opposite of what `joinSentences` above works to produce.
+        #
+        # So: stream and stay whole, or fall back and split.  In the fallback
+        # the breath is worth giving up, because the alternative is a second
+        # and a third of silence before anything is said at all.
+        pieces = _splitUtterance(text) if not self._streaming else [text]
         pcm = None
         for piece in pieces:
             if self._stopped or self._epoch != epoch:

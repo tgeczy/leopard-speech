@@ -116,3 +116,58 @@ def test_a_sentence_end_is_preferred_to_a_phrase_boundary():
             "this long enough to be worth splitting at all.")
     first = ls._splitUtterance(text)[0]
     assert first.rstrip().endswith("two text files!"), repr(first)
+
+
+def test_a_streaming_host_is_sent_the_text_whole(monkeypatch):
+    """Splitting is for the fallback, not for the normal path.
+
+    A sentence end is exactly where Alex breathes -- N sentences in one
+    utterance give N-1 breaths, at the boundaries and nowhere else -- so
+    cutting there removes them. Measured on a four-sentence paragraph, whole
+    against split into three: 9 pauses of 70 ms or more against 5, and 1.36 s
+    of silence against 1.08.
+
+    And against a streaming host it buys nothing to pay for that, because the
+    first chunk is already on its way while the rest renders: 33.4 ms split
+    against 30.8 ms whole, same driver, same text. The 1323 ms that justified
+    splitting was measured with streaming switched off by the bug fixed
+    alongside it.
+
+    So the rule is: stream and stay whole, fall back and split. This test is
+    the one that argues with anyone who re-enables it.
+    """
+    called = []
+    real = ls._splitUtterance
+    monkeypatch.setattr(ls, "_splitUtterance",
+                        lambda t: called.append(t) or real(t))
+
+    long_text = ("The engine renders at about ninety times real time. "
+                 "That is why the wait before the first sound was never the "
+                 "engine's fault. It was ours, and the host accumulated the "
+                 "whole utterance before handing over a single sample.")
+
+    d = ls.SynthDriver()
+    try:
+        d._streaming = True
+        d.speak([long_text])
+        _settle_quiet(d)
+        assert called == [], "a streaming host was sent split text"
+
+        d._streaming = False
+        d.speak([long_text])
+        _settle_quiet(d)
+        assert called, "the fallback did not split, so long text waits again"
+    finally:
+        d.terminate()
+
+
+def _settle_quiet(driver, timeout=20.0):
+    import time
+    end = time.perf_counter() + timeout
+    seen = driver._player.bytes
+    while time.perf_counter() < end:
+        time.sleep(0.05)
+        if driver._player.bytes > seen:
+            seen = driver._player.bytes
+            end = time.perf_counter() + 1.0
+    return seen
