@@ -296,6 +296,8 @@ import leopardtree as tree                                    # noqa: E402
 #: Python's own standard library, and this folder is at the front of
 #: `sys.path`, so a file of that name would shadow it for the whole of NVDA.
 import leopardnumbers                                         # noqa: E402
+#: Prefixed for the same reason as the two above.
+import leopardstress                                          # noqa: E402
 
 HOST_EXE = tree.HOST_EXE
 find_tree = tree.find_tree
@@ -453,6 +455,25 @@ class SynthDriver(SynthDriver):
             _("Expand &abbreviations (5KB, 1,234MB, 20ish)"),
             defaultVal=True,
         ),
+        # Alex says "cologne" for "colon" whenever a word follows it, which is
+        # every timestamp and every Windows path.  It is de-accenting, not
+        # letter-to-sound, and no engine parameter reaches it -- see
+        # leopardstress.py for the eleven that were tried.
+        #
+        # On by default, which is a departure worth being explicit about: this
+        # overrides a pronunciation, and normally that is the user's pen.  Two
+        # things earn it.  The word that comes out is a *different word* rather
+        # than an odd reading of the right one, and nobody ever heard this
+        # voice raw -- Alex reached listeners through VoiceOver, with its own
+        # symbol handling in front of it.
+        #
+        # The example in the label is a form that actually fails: "colon" on
+        # its own is fine, it is "colon" with something after it that is not.
+        BooleanDriverSetting(
+            "fixStress",
+            _("&Fix words the engine stresses wrongly (colon, as in 3:45)"),
+            defaultVal=True,
+        ),
     )
     supportedCommands = {speech.commands.IndexCommand,
                          speech.commands.BreakCommand,
@@ -510,6 +531,10 @@ class SynthDriver(SynthDriver):
         self._expandAbbreviations = True
         self._joinSentences = True
         self._numberStyle = "fix"
+        #: Unlike the two above, this one is applied to the text in this
+        #: process -- nothing is passed to the host -- so changing it takes
+        #: effect on the next utterance and needs no restart.
+        self._fixStress = True
         #: Whether anything has been spoken since the last cancel.  Joining
         #: never waits for the *first* utterance of a run, so starting to read
         #: is as immediate as it was; from the second on, the next line is
@@ -928,6 +953,18 @@ class SynthDriver(SynthDriver):
             text = "".join(
                 part if part.startswith("[[")
                 else leopardnumbers.expand(part, self._numberStyle)
+                for part in COMMAND_SPLIT_RE.split(text))
+        if self._fixStress:
+            #: Outside the commands for the same reason the numbers are: a
+            #: respelling inside "[[rate 200]]" would corrupt the command.
+            #:
+            #: The word arrives already spelt out -- NVDA's symbol dictionary
+            #: turns ":" into "colon" long before the driver is handed the
+            #: text, which is why the engine never sees the punctuation at all.
+            #: Running after the number expansion simply keeps the two rewrites
+            #: from meeting: that one works on digits, this one on words.
+            text = "".join(
+                part if part.startswith("[[") else leopardstress.fix(part)
                 for part in COMMAND_SPLIT_RE.split(text))
         # Volume is the engine's own [[volm]] command, not gain applied to
         # the PCM afterwards.  Measured on both engines it is exactly
@@ -1735,6 +1772,16 @@ class SynthDriver(SynthDriver):
                                    self._expandAbbreviations, value)
             self._expandAbbreviations = value
             self._restartHost()
+
+    def _get_fixStress(self):
+        return self._fixStress
+
+    def _set_fixStress(self, value):
+        value = bool(value)
+        if value != self._fixStress:
+            self._logSettingChange("fixStress", self._fixStress, value)
+            self._fixStress = value
+            # No _restartHost: the respelling happens here, not in the host.
 
     def _get_availableNumberstyles(self):
         from collections import OrderedDict

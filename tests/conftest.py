@@ -157,7 +157,17 @@ def _install_fake_nvda():
 
     sdh = types.ModuleType("synthDriverHandler")
     class _Setting(object):
-        def __init__(self, *a, **k): pass
+        """Records what it was given, where the real one would build a control.
+
+        It used to discard its arguments, which meant the settings panel was
+        the one part of the driver no test could look at -- including the two
+        things that have actually gone wrong there: a default flipped by
+        accident, and two labels claiming the same access key.
+        """
+        def __init__(self, *a, **k):
+            self.id = a[0] if len(a) > 0 else k.get("id")
+            self.displayName = a[1] if len(a) > 1 else k.get("displayName")
+            self.defaultVal = k.get("defaultVal", a[2] if len(a) > 2 else None)
     class VoiceInfo(object):
         def __init__(self, id, name, language=None):
             self.id, self.name, self.language = id, name, language
