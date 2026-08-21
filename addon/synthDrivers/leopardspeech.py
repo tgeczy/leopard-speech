@@ -158,6 +158,105 @@ PITCH_SEMITONES = 12
 #: and the default has to be the engine exactly as it comes.
 INFLECTION_MAX_PMOD = 200
 
+#: Where the volume slider's 100 sits. Everything below it is clean; the last
+#: tenth is deliberately allowed past what a voice can render without clipping,
+#: for anyone who would rather have the loudness and accept the distortion.
+#:
+#: 90 rather than 100 so that headroom exists at all, and rather than 50
+#: because NVDA's own default of 50 is genuinely too quiet -- Eloquence ships
+#: 92 for the same reason.
+VOLUME_CLEAN = 90
+
+#: **The engine clamps `[[volm]]` at 2.0.** Asked for 3 or 4 it renders exactly
+#: what 2 renders, so this is a real ceiling and not a guess.
+VOLUME_MAX_VOLM = 2.0
+
+#: No voice is given more than this, whatever its headroom measures.
+#:
+#: Right at the engine's own 2.0 clamp the arithmetic stops holding: Whisper
+#: measures peak 32654 at 1.90 and then clips at 2.00, which is not the 3%
+#: rise that gain would give. Something saturates there. Rather than model it,
+#: stay below it -- the difference between 1.80 and 2.00 is 0.9 dB and nobody
+#: can hear it, while the clipping it avoids is audible.
+VOLUME_NORM_CEILING = 1.80
+
+#: How far each voice may be turned up, so that one slider position means
+#: roughly one loudness whichever voice is speaking.
+#:
+#: **Alex, the default voice, is the quietest speaking voice in the set.** At
+#: `volm 1.0` -- which is what the driver used to send at 100 -- it measures
+#: RMS 2473 against Bruce's 5899, nearly 8 dB down. That is why Leopard has
+#: always sounded quieter than the Tiger and outSPOKEN add-ons, and it is what
+#: this table exists to correct.
+#:
+#: Built by `tools/volume_table.py`, worst case across three probe texts,
+#: because peak is set by whatever transient the text happens to contain and a
+#: factor measured on prose will clip on a list of numbers. Each entry is
+#:
+#:     max(1.0, min(safe, loudest_voice_level / this_voice_level))
+#:
+#: so quiet voices come up to meet the loudest one and **nothing is ever
+#: turned down**. Equalising properly -- bringing the loud voices down as well
+#: -- was measured and rejected: the limit is `Whisper`, which is supposed to
+#: be quiet, and matching it would have cost Bruce 8.9 dB and Alex 1.2.
+#:
+#: Voices that cannot reach the target keep their character: Whisper is still
+#: the quietest thing here, it is simply 6 dB less faint than it was.
+#:
+#: Many of the formant voices share a ceiling of exactly 17200, which is a
+#: limiter inside the engine rather than a coincidence, and gives them all the
+#: same factor.
+#:
+#: **Every entry is held about 1 dB below the measured ceiling.** A first
+#: version used the maximum exactly and Whisper clipped thirteen samples the
+#: moment a test used a sentence the table had not been fitted to. A ceiling
+#: fitted to five texts is not a ceiling for every text, and an inaudible
+#: decibel is a cheap price for that.
+VOLUME_NORM = {
+    "Agnes": 1.00,
+    "Albert": 1.70,
+    "Alex": 1.80,
+    "BadNews": 1.80,
+    "Bahh": 1.70,
+    "Bells": 1.70,
+    "Boing": 1.70,
+    "Bruce": 1.00,
+    "Bubbles": 1.70,
+    "Cellos": 1.70,
+    "Deranged": 1.70,
+    "Fred": 1.80,
+    "GoodNews": 1.80,
+    "Hysterical": 1.70,
+    "Junior": 1.80,
+    "Kathy": 1.73,
+    "Organ": 1.70,
+    "Princess": 1.70,
+    "Ralph": 1.70,
+    "Trinoids": 1.70,
+    "Vicki": 1.20,
+    "Victoria": 1.00,
+    "Whisper": 1.80,
+    "Zarvox": 1.70,
+}
+
+#: What an unmeasured voice gets. 1.0 is the level it has always had, which is
+#: the only safe answer: a voice nobody has measured might already be at the
+#: ceiling, and guessing high turns it into distortion.
+VOLUME_NORM_DEFAULT = 1.0
+
+
+def volume_volm(volume, voice):
+    """-> the `[[volm]]` value for this slider position and this voice.
+
+    `VOLUME_CLEAN` is where the voice reaches its measured maximum, so 0..90
+    is the clean range and 90..100 asks for more than the voice can render
+    without clipping. That is the trade the slider's last tenth exists to
+    offer, and it is why the default sits at 90 rather than at the top.
+    """
+    norm = VOLUME_NORM.get(voice, VOLUME_NORM_DEFAULT)
+    return min(VOLUME_MAX_VOLM,
+               norm * max(0, volume) / float(VOLUME_CLEAN))
+
 #: An embedded speech command, as the engine's front end parses it.  Non-greedy, and
 #: it will not run past a newline, so an unclosed "[[" cannot eat a paragraph.
 COMMAND_RE = re.compile(r"\[\[[^\]]{0,64}\]\]")
@@ -223,10 +322,16 @@ def _fullVolumeByDefault(setting):
     what a tester reported: "alex got quieter, not by a whole lot, but it was
     definitely noticeable".
 
-    Full is the right default for a synthesizer that had no volume control at
-    all yesterday: upgrading should change nothing until the user asks it to.
+    **90, not 100**, and not because 100 would be too loud. 90 is where each
+    voice reaches its own measured maximum: see `VOLUME_NORM`. The last tenth
+    of the slider deliberately asks for more than the voice can render
+    cleanly, so anyone who wants the loudness more than they mind the
+    distortion can have it -- and nobody gets it by accident.
+
+    Eloquence ships 92 for much the same reason, so this is a setting users
+    have met before.
     """
-    setting.defaultVal = 100
+    setting.defaultVal = VOLUME_CLEAN
     return setting
 
 
@@ -736,7 +841,7 @@ class SynthDriver(SynthDriver):
         self._pauseMode = "short"
         self._rateBoost = False
         self._inflection = 50
-        self._volume = 100
+        self._volume = VOLUME_CLEAN
         #: Both reach the engine through the host's environment, which is read
         #: once at startup, so changing either restarts the host.
         self._phrasing = "fewest"
@@ -752,9 +857,10 @@ class SynthDriver(SynthDriver):
         #: is as immediate as it was; from the second on, the next line is
         #: normally queued already and the wait is zero anyway.
         self._spokeSinceCancel = False
-        #: Whether a non-default volume or inflection has been sent to the
-        #: engine and is still in force on the channel.
-        self._volumeSent = False
+        #: Whether a non-default inflection has been sent to the engine and is
+        #: still in force on the channel. Volume needs no such flag any more:
+        #: it is sent on every utterance, because the level is per-voice and
+        #: has to be restated whenever the voice changes anyway.
         self._inflectionSent = False
         self._voiceId = self._voices[0][0]
         # Prefer Alex, then Fred. Alex is the reason this add-on exists, and
@@ -1218,12 +1324,20 @@ class SynthDriver(SynthDriver):
         elif self._inflectionSent:
             text = "[[pmod 100]]%s" % text
             self._inflectionSent = False
-        if self._volume < 100:
-            text = "[[volm %.3f]]%s" % (self._volume / 100.0, text)
-            self._volumeSent = True
-        elif self._volumeSent:
-            text = "[[volm 1.000]]%s" % text
-            self._volumeSent = False
+        # **Volume is always sent now, and that is the simpler rule.**
+        #
+        # It used to be sent only when it was not the default, with one more
+        # on the way back, precisely because the command sets channel state
+        # that outlives the utterance -- the "silent for good at 0, and only
+        # 99 brings it back" failure above. That bookkeeping is gone: the
+        # level is per-voice, so it has to be restated whenever the voice
+        # changes anyway, and restating it every time is both cheaper to
+        # reason about and impossible to get wrong.
+        #
+        # `volm 1.000` renders byte-identically to sending nothing, measured,
+        # so the voices whose factor is 1.0 -- Bruce, Victoria, Agnes -- are
+        # exactly as they were.
+        text = "[[volm %.3f]]%s" % (volume_volm(self._volume, voice), text)
         #: Ours, and only ours.  A cancel can retire this process and
         #: start its replacement while this call is still in the read
         #: below, and the failure that follows must not kill the host the

@@ -758,7 +758,10 @@ def test_volume_defaults_to_full_not_nvdas_fifty():
     import leopardspeech
     from synthDriverHandler import SynthDriver
     setting = leopardspeech._fullVolumeByDefault(SynthDriver.VolumeSetting())
-    assert setting.defaultVal == 100
+    # 90, not 100: that is where each voice reaches its own measured maximum,
+    # and the last tenth of the slider is deliberately past it for anyone who
+    # wants loudness more than they mind clipping. Still emphatically not 50.
+    assert setting.defaultVal == leopardspeech.VOLUME_CLEAN == 90
 
     # And it has to be the setting the driver actually offers, not one made
     # up by the test.
@@ -1319,3 +1322,132 @@ def test_interrupting_over_and_over_leaves_one_engine_running(driver,
     driver.speak(["still here"])
     assert _settle(driver._player, before + 1, timeout=10.0) > before, (
         "the synthesizer went silent after being interrupted repeatedly")
+
+
+# -- per-voice volume -------------------------------------------------------
+#
+# Alex, the default voice, is the quietest speaking voice in the set: RMS 2473
+# at `volm 1.0` against Bruce's 5899, nearly 8 dB down. That is why Leopard has
+# always sounded quieter than the Tiger and outSPOKEN add-ons at the same
+# setting, and why the slider now scales to each voice's own measured maximum.
+
+
+def _rms(pcm):
+    import struct as _s
+    if not pcm:
+        return 0.0
+    v = _s.unpack("<%dh" % (len(pcm) // 2), pcm)
+    return (sum(float(x) * x for x in v) / max(1, len(v))) ** 0.5
+
+
+def _peak_and_clipped(pcm):
+    import struct as _s
+    if not pcm:
+        return 0, 0
+    v = _s.unpack("<%dh" % (len(pcm) // 2), pcm)
+    return (max(max(v), -min(v)),
+            sum(1 for x in v if x >= 32766 or x <= -32767))
+
+
+def test_the_volume_table_covers_every_voice_we_offer(driver):
+    """An unmeasured voice silently gets 1.0, which is quiet but never wrong.
+
+    Worth failing on anyway: a voice added later should be measured rather
+    than left behind at the old level while everything around it got louder.
+    """
+    import leopardspeech
+    missing = [entry[0] for entry in driver._voices
+               if entry[0] not in leopardspeech.VOLUME_NORM]
+    assert not missing, (
+        "not in VOLUME_NORM, so they stay at the old level: %s -- run "
+        "tools/volume_table.py" % ", ".join(missing))
+
+
+def test_ninety_never_clips_more_than_the_voice_already_did(driver):
+    """**The promise the default makes**, and it is not "nothing clips".
+
+    It cannot be, because **Victoria already clips at its own natural level**
+    -- 11 samples on a vowel-heavy probe at `volm 1.0`, which is exactly what
+    every previous release sent at volume 100. It scales perfectly well and
+    only becomes clean at 0.75, so removing those eleven samples would mean
+    turning Victoria down 2.5 dB. Eleven samples in two hundred thousand
+    against a voice audibly quieter than everything around it is a bad trade,
+    so the distortion stays and this test says so out loud rather than
+    pretending otherwise.
+
+    What must hold is that the table never makes a voice *worse* than it was.
+
+    A handful of voices rather than all twenty-four, because each one is two
+    real renders; these are the extremes -- loudest, quietest, and the ones
+    already at the ceiling.
+    """
+    _warm(driver)
+    driver._acceptCommands = True   # or COMMAND_RE strips the baseline prefix
+    text = ("The US Chamber of Commerce warned Tuesday. Ah, oh, ooh, aye. "
+            "WARNING! ERROR! Take a big pack of tickets, Bobby.")
+    for voice in ("Alex", "Bruce", "Victoria", "Whisper", "Fred"):
+        if voice not in driver._get_availableVoices():
+            continue
+        driver._set_voice(voice)
+        was = _peak_and_clipped(
+            driver._render("[[volm 1.000]]" + text, driver._wpm(), voice))[1]             if driver._acceptCommands else None
+        driver._set_volume(90)
+        peak, clipped = _peak_and_clipped(
+            driver._render(text, driver._wpm(), voice))
+        assert peak, "%s rendered nothing" % voice
+        if was is None:
+            assert not clipped, (
+                "%s clips %d samples at the default volume -- its VOLUME_NORM "
+                "is too high" % (voice, clipped))
+        else:
+            assert clipped <= was, (
+                "%s clips %d samples at the default volume against %d at its "
+                "own natural level -- VOLUME_NORM made it worse"
+                % (voice, clipped, was))
+
+
+def test_alex_is_no_longer_the_quiet_one(driver):
+    """The whole point of the table, stated as the thing a listener notices.
+
+    Alex used to sit nearly 8 dB below Bruce at the same setting. It is not
+    required to match -- Bruce cannot be turned up at all, so the gap closes
+    from Alex's side only -- but it must close.
+    """
+    _warm(driver)
+    text = "The US Chamber of Commerce warned Tuesday that tariffs would rise."
+    driver._set_volume(90)
+    levels = {}
+    for voice in ("Alex", "Bruce"):
+        if voice not in driver._get_availableVoices():
+            import pytest
+            pytest.skip("need both Alex and Bruce")
+        driver._set_voice(voice)
+        levels[voice] = _rms(driver._render(text, driver._wpm(), voice))
+    import math
+    gap = 20 * math.log10(levels["Bruce"] / levels["Alex"])
+    assert gap < 4.0, (
+        "Alex is still %.1f dB below Bruce; it used to be 7.6 and the table "
+        "is meant to close that" % gap)
+
+
+def test_the_last_tenth_of_the_slider_really_is_louder(driver):
+    """90 to 100 has to do something, or the range is a lie.
+
+    It cannot do much on a voice already at its ceiling -- the engine clamps
+    volm at 2.0 -- so this asks a voice with room, and only that it rises.
+    """
+    _warm(driver)
+    text = "Testing the top of the volume range."
+    voice = "Bruce" if "Bruce" in driver._get_availableVoices() else None
+    if voice is None:
+        import pytest
+        pytest.skip("need Bruce, which has headroom above its clean maximum")
+    driver._set_voice(voice)
+    driver._set_volume(90)
+    clean = _rms(driver._render(text, driver._wpm(), voice))
+    driver._set_volume(100)
+    hot = _rms(driver._render(text, driver._wpm(), voice))
+    driver._set_volume(90)
+    assert hot > clean * 1.05, (
+        "100 gave %.0f against 90's %.0f -- the last tenth does nothing"
+        % (hot, clean))

@@ -29,14 +29,36 @@ RATE = 22050
 WIN = RATE // 100                      # 10 ms
 
 
+#: What Alex measured at `volm 1.0`, which is the level every threshold below
+#: was calibrated against.
+#:
+#: The driver now sends a per-voice `[[volm]]` on every utterance -- Alex is
+#: the quietest speaking voice in the set and is turned up by 6 dB -- so a
+#: breath that peaked near 680 now peaks near 1360 and sails straight past the
+#: "is this stretch quiet" test at 900. **The thresholds are not wrong, the
+#: scale moved**, so normalise rather than re-tune: a detector that has to be
+#: recalibrated every time the volume changes is a detector that will be
+#: silently wrong one day.
+REFERENCE_PEAK = 14000
+
+
 def _samples(rendered):
-    """The driver's renders are wav bytes or raw frames, depending on caller."""
+    """The driver's renders are wav bytes or raw frames, depending on caller.
+
+    Normalised to REFERENCE_PEAK so everything below is scale-invariant.
+    """
     a = array.array("h")
     if rendered[:4] == b"RIFF":
         w = wave.open(io.BytesIO(rendered), "rb")
         a.frombytes(w.readframes(w.getnframes()))
     else:
         a.frombytes(rendered[:len(rendered) // 2 * 2])
+    if not len(a):
+        return a
+    peak = max(max(a), -min(a))
+    if peak and abs(peak - REFERENCE_PEAK) > REFERENCE_PEAK // 20:
+        k = REFERENCE_PEAK / float(peak)
+        a = array.array("h", [int(v * k) for v in a])
     return a
 
 
